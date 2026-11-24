@@ -403,6 +403,42 @@ fn tool(name: &str) -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// Opens a console in `dir`: Windows Terminal when installed (Win11's "Open in Terminal"), a classic cmd window otherwise.
+fn open_terminal(dir: &Path) {
+    let wt = env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join(r"Microsoft\WindowsApps\wt.exe"));
+    match wt.filter(|p| p.is_file()) {
+        Some(wt) => { let _ = std::process::Command::new(wt).arg("-d").arg(dir).spawn(); }
+        None => { let _ = std::process::Command::new("cmd.exe").current_dir(dir).spawn(); }
+    }
+}
+
+/// `prog`, or `prog.exe` / .cmd / .bat / .com, found in the PATH (a path with a directory in it is taken as it is).
+fn which(prog: &str) -> Option<PathBuf> {
+    let p = Path::new(prog);
+    if p.components().count() > 1 { return p.is_file().then(|| p.to_path_buf()); }
+    let path = env::var_os("PATH")?;
+    for dir in env::split_paths(&path) {
+        for ext in ["", ".exe", ".cmd", ".bat", ".com"] {
+            let c = dir.join(format!("{prog}{ext}"));
+            if c.is_file() { return Some(c); }
+        }
+    }
+    None
+}
+
+/// Explorer's address bar behaviour: text that is not a folder but names a program runs it here, with the rest as arguments
+/// ("cmd", "powershell -NoLogo", "wt"). true when something was started.
+fn run_command_line(owner: HWND, dir: &Path, line: &str) -> bool {
+    let Some(prog) = line.split_whitespace().next() else { return false };
+    let Some(exe) = which(prog) else { return false };
+    let params = line[prog.len()..].trim_start();
+    // ShellExecute, like Explorer: it gives a console program a console of its own; Command would hand it our (missing)
+    // stdin and cmd would exit at once
+    let (verb, file, args, cwd) = (w("open"), w(&exe.to_string_lossy()), w(params), w(&dir.to_string_lossy()));
+    let r = unsafe { ShellExecuteW(owner, verb.as_ptr(), file.as_ptr(), if params.is_empty() { ptr::null() } else { args.as_ptr() }, cwd.as_ptr(), SW_SHOWNORMAL) };
+    r as usize > 32
+}
+
 /// Same list as photoview's EXTS.
 fn is_pic(p: &std::path::Path) -> bool {
     p.extension().and_then(|e| e.to_str()).is_some_and(|e| ["jpg", "jpeg", "jfif", "png", "bmp", "gif", "tif", "tiff", "webp", "heic", "avif"].contains(&e.to_ascii_lowercase().as_str()))
@@ -791,6 +827,7 @@ unsafe fn bg_menu(h: HWND) {
             action(7, t!("Обновить", "Refresh", ja: "最新の情報に更新", pt: "Atualizar", zh: "刷新"), "\u{E72C}"),
             ctxmenu::Item { id: 12, text: t!("Вставить", "Paste", ja: "貼り付け", pt: "Colar", zh: "粘贴").into(), glyph: "\u{E77F}", disabled: !paste_on, ..Default::default() },
             sub(t!("Создать", "New", ja: "新規作成", pt: "Novo", zh: "新建"), "\u{E710}", new),
+            action(8, t!("Открыть в терминале", "Open in Terminal", ja: "ターミナルで開く", pt: "Abrir no Terminal", zh: "在终端中打开"), "\u{E756}"),
             ctxmenu::Item::separator(),
         ];
         if disk.is_some() {
@@ -798,6 +835,7 @@ unsafe fn bg_menu(h: HWND) {
         }
         items.push(action(5, t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性"), "\u{E713}"));
         match ctxmenu::show(h, items, (pt.x, pt.y)) {
+            ctxmenu::Pick::Id(8) => open_terminal(&cur_dir()),
             ctxmenu::Pick::Id(5) => properties(&cur_dir()),
             ctxmenu::Pick::Id(6) => { // wiztree takes the drive letter and asks for admin rights itself
                 let dir = cur_dir();
@@ -3287,6 +3325,9 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     if let Some(q) = text.trim().strip_prefix('?') {
                         if !q.trim().is_empty() { search(h, q.trim()); SetFocus(list); return 0; } // keep the query in the bar
                     } else if p.is_dir() || zipx::split_zip(&p).is_some() { load(h, p); } // also a path inside a .zip
+                    else if !text.trim().is_empty() { // like Explorer: a program (or a file path) typed here runs in this folder
+                        let _ = run_command_line(h, &cur_dir(), text.trim());
+                    }
                 }
                 SetWindowTextW(edit, w(&page_name(&cur_dir()).map_or_else(|| cur_dir().to_string_lossy().into_owned(), str::to_string)).as_ptr()); // also undoes a bad path / Esc
                 SetFocus(list);
