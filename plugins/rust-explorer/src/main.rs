@@ -1216,6 +1216,8 @@ fn load(h: HWND, dir: PathBuf) {
     }
     if !desk() {
         let list = ST.with_borrow(|st| st.list);
+        // the list still holds the previous folder's items: restyling it with those inside lays every one of them out again
+        put(list, LVM_DELETEALLITEMS, 0, 0);
         if let Some((view, sort, asc, group, w)) = read_view_pref(&dir) {
             SORT_COL.store(sort, Relaxed);
             SORT_ASC.store(asc, Relaxed);
@@ -1371,6 +1373,7 @@ fn fill_items() {
             put(list, LVM_INSERTITEMW, 0, &it as *const _ as isize);
         }
         SendMessageW(list, 0x000B, 1, 0);
+        if !matches!(view, ViewMode::Details | ViewMode::List) { put(list, 0x1016, 0, 0); } // LVM_ARRANGE, LVA_DEFAULT: lay the icons out once
         InvalidateRect(list, ptr::null(), 0);
     }
     if view.wants_thumbs() {
@@ -1389,8 +1392,9 @@ fn fill_items() {
 
 fn reset_thumbs() {
     GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let himl = ST.with_borrow(|st| st.himl);
-    unsafe { ImageList_Remove(himl as _, -1) };
+    ST.with_borrow(|st| unsafe { ImageList_Remove(st.himl as _, -1) });
+    // the indexes are gone: every row asks for its thumbnail again
+    ST.with(|c| if let Ok(mut st) = c.try_borrow_mut() { st.rows.iter_mut().for_each(|r| r.thumb = -2); });
 }
 
 fn reload(h: HWND) { load(h, cur_dir()); }
@@ -1584,13 +1588,12 @@ fn apply_view(list: HWND, view: ViewMode) {
     if view.icon_px() > 16 { ensure_iml(list, view.icon_px()); }
     // an owner-data list ignores LVM_SETVIEW (it only hides the header): the view is the window style's type bits.
     // Icon views also need LVS_AUTOARRANGE, or the control leaves every virtual item at the same spot.
-    let auto = !matches!(view, ViewMode::Details | ViewMode::List);
     let ty = match view {
         ViewMode::Details => LVS_REPORT,
         ViewMode::List => LVS_LIST,
         ViewMode::Small => LVS_SMALLICON,
         _ => LVS_ICON, // the icon sizes and tiles differ by the image list
-    } | if auto { LVS_AUTOARRANGE } else { 0 };
+    };
     unsafe {
         let style = GetWindowLongPtrW(list, GWL_STYLE) as u32;
         SetWindowLongPtrW(list, GWL_STYLE, ((style & !(LVS_TYPEMASK | LVS_AUTOARRANGE)) | ty) as isize);
@@ -1600,12 +1603,15 @@ fn apply_view(list: HWND, view: ViewMode) {
 }
 
 /// Details, list, the four icon sizes or tiles (the View menu and Ctrl+wheel).
-fn set_view(h: HWND, view: ViewMode) {
+fn set_view(_h: HWND, view: ViewMode) {
     let list = ST.with_borrow_mut(|st| { st.view = view; st.thumbs = view != ViewMode::Details; st.list });
     THUMBS.store(view != ViewMode::Details, Relaxed);
+    // empty the list first: restyling a list full of items makes the control lay all of them out again (seconds on thousands)
+    put(list, LVM_DELETEALLITEMS, 0, 0);
     apply_view(list, view);
-    save_current_view(); // before the reload: load() restores this folder's saved view
-    reload(h);
+    save_current_view();
+    fill_items();
+    unsafe { InvalidateRect(list, ptr::null(), 0) };
 }
 
 /// Ctrl+wheel: details -> list -> small / medium / large / extra large icons, and back.
