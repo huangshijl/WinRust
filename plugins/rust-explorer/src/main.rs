@@ -922,7 +922,7 @@ fn start_target() -> (PathBuf, Option<String>) {
     let p = PathBuf::from(p.trim_matches('"'));
     // a path given with forward slashes (a command line or a URL-like string) is normalized: shell APIs want backslashes
     let p = if p.to_string_lossy().contains('/') { PathBuf::from(p.to_string_lossy().replace('/', "\\")) } else { p };
-    if p.as_os_str().is_empty() { return (PathBuf::from("C:\\"), None); }
+    if p.as_os_str().is_empty() { return (PathBuf::from("::home"), None); } // a fresh start: the Home page, as Win11 Explorer
     match (p.is_file(), p.parent()) {
         (true, Some(d)) => (d.to_path_buf(), p.file_name().map(|n| n.to_string_lossy().into_owned())),
         _ => (p, None),
