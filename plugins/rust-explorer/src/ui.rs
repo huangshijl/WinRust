@@ -295,9 +295,10 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             // the Explorer theme paints column separators into the empty area below the rows; cover it with the list colour
             let n = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0);
             let mut bottom = 0;
+            let mut known = n == 0;
             if n > 0 {
                 let mut r = RECT { left: LVIR_BOUNDS as i32, ..std::mem::zeroed() };
-                if SendMessageW(list, LVM_GETITEMRECT, n as usize - 1, &mut r as *mut _ as isize) != 0 { bottom = r.bottom; }
+                if SendMessageW(list, LVM_GETITEMRECT, n as usize - 1, &mut r as *mut _ as isize) != 0 { bottom = r.bottom; known = true; }
             }
             let (mut right, mut bot) = (cr.right, cr.bottom);
             let mut vr: RECT = std::mem::zeroed();
@@ -305,7 +306,7 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
                 if vr.bottom > cr.bottom { right -= GetSystemMetrics(SM_CXVSCROLL); } // the bars stay
                 if vr.right > cr.right { bot -= GetSystemMetrics(SM_CYHSCROLL); }
             }
-            if bottom < bot {
+            if known && bottom < bot {
                 let b = CreateSolidBrush(listbg());
                 FillRect(dc, &rc(0, bottom, right, bot), b);
                 DeleteObject(b as HGDIOBJ);
@@ -379,10 +380,35 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             // columns from the header widths (left of the row = minus the horizontal scroll)
             let cw: Vec<i32> = (0..4).map(|k| SendMessageW(list, LVM_GETCOLUMNWIDTH, k, 0) as i32).collect();
             let x: Vec<i32> = (0..4).map(|k| r.left + cw[..k].iter().sum::<i32>()).collect();
+            // item check boxes: our own square at the head of the name column
+            let cb = if crate::CHECK_BOXES.load(Relaxed) { sc(26) } else { 0 };
+            if cb > 0 {
+                let side = sc(15);
+                let boxr = rc(x[0] + sc(7), (r.top + r.bottom - side) / 2, x[0] + sc(7) + side, (r.top + r.bottom + side) / 2);
+                let on = crate::checked(&name);
+                let bgc = if bg != listbg() { bg } else { listbg() };
+                if on {
+                    fill(dc, boxr, pal().accent, sc(3));
+                    SetBkMode(dc, TRANSPARENT as i32);
+                    let fc = font(9, 700, winrust_common::style::icon_face());
+                    let ofc = SelectObject(dc, fc as HGDIOBJ);
+                    text(dc, "\u{E73E}", boxr, 0x00FFFFFF, DT_CENTER);
+                    SelectObject(dc, ofc);
+                    DeleteObject(fc as HGDIOBJ);
+                } else {
+                    let pen = CreatePen(PS_SOLID, 1, mix(bgc, pal().dim, if hot { 0.85 } else { 0.6 }));
+                    let op = SelectObject(dc, pen as HGDIOBJ);
+                    let ob = SelectObject(dc, GetStockObject(NULL_BRUSH) as HGDIOBJ);
+                    RoundRect(dc, boxr.left, boxr.top, boxr.right, boxr.bottom, sc(6), sc(6));
+                    SelectObject(dc, ob);
+                    SelectObject(dc, op);
+                    DeleteObject(pen as HGDIOBJ);
+                }
+            }
             let himl = SendMessageW(list, LVM_GETIMAGELIST, LVSIL_SMALL as usize, 0);
             let (mut iw, mut ih) = (0, 0);
             ImageList_GetIconSize(himl as _, &mut iw, &mut ih);
-            if icon >= 0 { ImageList_Draw(himl as _, icon, dc, x[0] + sc(16), (r.top + r.bottom - ih) / 2, ILD_TRANSPARENT); }
+            if icon >= 0 { ImageList_Draw(himl as _, icon, dc, x[0] + sc(16) + cb, (r.top + r.bottom - ih) / 2, ILD_TRANSPARENT); }
             if FONTS.get().0 == 0 { FONTS.set((font(13, 400, ui_face()), font(12, 400, ui_face()))); }
             let (f_name, f_det) = FONTS.get();
             SetBkMode(dc, TRANSPARENT as i32);
@@ -391,7 +417,7 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             let hit_of_search = !virtual_row && p.is_absolute(); // search hits are absolute paths: the name column shows just the file name
             let shown = if virtual_row { name.clone() } else if hit_of_search { p.file_name().map_or(name.clone(), |n| n.to_string_lossy().into_owned()) } else { crate::shown_name(&name, false, is_dir) };
             let shown = if hit_of_search { crate::shown_name(&shown, false, is_dir) } else { shown };
-            text(dc, &shown, rc(x[0] + sc(16) + iw + sc(12), r.top, x[1] - sc(8), r.bottom), pal().text, DT_LEFT);
+            text(dc, &shown, rc(x[0] + sc(16) + cb + iw + sc(12), r.top, x[1] - sc(8), r.bottom), pal().text, DT_LEFT);
             SelectObject(dc, f_det as HFONT);
             let dim = if sel { mix(pal().dim, pal().text, 0.45) } else { pal().dim };
             text(dc, &date_text(time), rc(x[1] + sc(10), r.top, x[2] - sc(8), r.bottom), dim, DT_LEFT);
@@ -996,10 +1022,7 @@ unsafe fn view_menu(h: HWND, at: RECT) {
     let g = GROUP.load(Relaxed);
     let compact = COMPACT.load(Relaxed);
     let ext = SHOW_EXT.load(Relaxed);
-    let checks = {
-        let list = ST.with_borrow(|s| s.list);
-        SendMessageW(list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) as isize & LVS_EX_CHECKBOXES as isize != 0
-    };
+    let checks = crate::CHECK_BOXES.load(Relaxed);
     let mut items = vec![
         mradio(80, t!("Очень крупные значки", "Extra large icons", ja: "特大アイコン", pt: "Ícones extragrandes", zh: "超大图标"), view == ViewMode::ExtraLarge),
         mradio(81, t!("Крупные значки", "Large icons", ja: "大アイコン", pt: "Ícones grandes", zh: "大图标"), view == ViewMode::Large),

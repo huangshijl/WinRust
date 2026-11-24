@@ -206,6 +206,10 @@ static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false); // Ctrl+H
 static SHOW_EXT: AtomicBool = AtomicBool::new(true); // View > File name extensions
 static COMPACT: AtomicBool = AtomicBool::new(false); // View > Compact view
 pub static NAV_ON: AtomicBool = AtomicBool::new(true); // View > Show > Navigation pane
+pub static CHECK_BOXES: AtomicBool = AtomicBool::new(false); // View > Show > Item check boxes (drawn by us)
+thread_local! { static CHECKED: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new()); } // names with their box ticked
+pub fn checked(name: &str) -> bool { CHECKED.with_borrow(|s| s.contains(name)) }
+fn tick(name: &str) -> bool { CHECKED.with_borrow_mut(|s| if s.remove(name) { false } else { s.insert(name.to_string()); true }) }
 static NAV: AtomicBool = AtomicBool::new(false); // loading from the back / forward trail: do not record it again
 const WM_NAV: u32 = WM_APP + 3; // wp: 1 back, 2 forward, 3 properties, 4 up (sent from the message loop for Alt+key)
 const WM_JOB: u32 = WM_APP + 5; // jobs.rs worker finished: wp = Box<Option<String>> (the error, if any)
@@ -734,10 +738,7 @@ unsafe fn bg_menu(h: HWND) {
         let check = |id: u32, text: &str, on: bool| ctxmenu::Item { id, text: text.into(), checked: on, ..Default::default() };
         let radio = |id: u32, text: &str, on: bool| ctxmenu::Item { id, text: text.into(), radio: true, checked: on, ..Default::default() };
         let sub = |text: &str, glyph: &'static str, items: Vec<ctxmenu::Item>| ctxmenu::Item { text: text.into(), glyph, sub: items, ..Default::default() };
-        let checks = {
-            let list = ST.with_borrow(|st| st.list);
-            SendMessageW(list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) as isize & LVS_EX_CHECKBOXES as isize != 0
-        };
+        let checks = CHECK_BOXES.load(Relaxed);
         let show = vec![
             check(90, t!("Область переходов", "Navigation pane", ja: "ナビゲーション ウィンドウ", pt: "Painel de navegação", zh: "导航窗格"), NAV_ON.load(Relaxed)),
             check(93, t!("Флажки элементов", "Item check boxes", ja: "項目のチェック ボックス", pt: "Caixas de seleção de itens", zh: "项目复选框"), checks),
@@ -1209,7 +1210,10 @@ fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
 /// Loads `dir` into the virtual list and the active tab. Unreadable dir (access denied, gone) leaves the view unchanged.
 /// Never call with ST borrowed: the list sends GETDISPINFO back into the window proc.
 fn load(h: HWND, dir: PathBuf) {
-    if !ST.with_borrow(|st| st.dir == dir) { COLLAPSED.with_borrow_mut(|s| s.clear()); } // another folder: its groups start open
+    if !ST.with_borrow(|st| st.dir == dir) {
+        COLLAPSED.with_borrow_mut(|s| s.clear()); // another folder: its groups start open
+        CHECKED.with_borrow_mut(|s| s.clear());
+    }
     if !desk() {
         let list = ST.with_borrow(|st| st.list);
         if let Some((view, sort, asc, group, w)) = read_view_pref(&dir) {
@@ -1261,8 +1265,7 @@ fn load(h: HWND, dir: PathBuf) {
     ui::nav_dirty(); // the pane highlights where we are
     if !desk() { ui::nav_sync(&dir); }
     reset_thumbs();
-    put(list, LVM_DELETEALLITEMS, 0, 0);
-    if desk() { desk::fill(list, n); } else { put(list, LVM_SETITEMCOUNT, n, 0); }
+    if desk() { desk::fill(list, n); } else { fill_items(); }
     if !desk() { unsafe { ui::fit_filler(list) }; }
     unsafe { ui::status_dirty(h) }; // the counts belong to the folder that was just opened
     start_watch(h, dir);
@@ -1300,13 +1303,11 @@ fn search(h: HWND, q: &str) {
         let root = if cur_virtual() { PathBuf::from(env::var_os("USERPROFILE").unwrap_or_else(|| "C:\\".into())) } else { cur_dir() };
         rows = local_search(&root, q).0;
     }
-    let n = rows.len();
     ui::set_search(Some(q.to_string()));
     if let Some(se) = ST.with_borrow(|st| (st.search != 0 as HWND).then_some(st.search)) { unsafe { SetWindowTextW(se, w(q).as_ptr()) }; }
-    let list = ST.with_borrow_mut(|st| { st.all = rows; st.rows = visible_rows(&st.all); st.list });
+    ST.with_borrow_mut(|st| { st.all = rows; st.rows = visible_rows(&st.all) });
     reset_thumbs();
-    put(list, LVM_DELETEALLITEMS, 0, 0);
-    put(list, LVM_SETITEMCOUNT, n, 0);
+    fill_items();
     unsafe { ui::status_dirty(h) };
 }
 
@@ -1343,6 +1344,49 @@ fn local_search(dir: &Path, q: &str) -> (Vec<Row>, bool, bool) {
 }
 
 /// Drops all thumbnails and invalidates in-flight ones; call whenever the rows are replaced.
+/// Fills the list with real items (name label and icon). The list is not virtual, so icon views lay the items out and
+/// thumbnails are attached to their items as they arrive.
+fn fill_items() {
+    let (list, view, dir, rows) = ST.with_borrow(|st| (st.list, st.view, st.dir.clone(), st.rows.clone()));
+    let desk = desk();
+    let mut data: Vec<(Vec<u16>, i32)> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let label = if r.hdr { r.name[1..].to_string() } else if r.target.is_some() { r.name.clone() } else { shown_name(&r.name, desk, r.dir) };
+        let img = if view.wants_thumbs() {
+            r.thumb // -1 when not loaded yet: the thumbnail replaces it later
+        } else {
+            if r.icon < 0 { icon_of(&r.target.clone().unwrap_or_else(|| dir.join(&r.name)), r.dir) } else { r.icon }
+        };
+        data.push((label.encode_utf16().chain([0]).collect(), img));
+    }
+    unsafe {
+        SendMessageW(list, 0x000B, 0, 0); // WM_SETREDRAW off while the items go in
+        put(list, LVM_DELETEALLITEMS, 0, 0);
+        for (i, (text, img)) in data.iter().enumerate() {
+            let mut it: LVITEMW = std::mem::zeroed();
+            it.mask = LVIF_TEXT | LVIF_IMAGE;
+            it.iItem = i as i32;
+            it.pszText = text.as_ptr() as *mut u16;
+            it.iImage = if *img < 0 { I_IMAGENONE } else { *img };
+            put(list, LVM_INSERTITEMW, 0, &it as *const _ as isize);
+        }
+        SendMessageW(list, 0x000B, 1, 0);
+        InvalidateRect(list, ptr::null(), 0);
+    }
+    if view.wants_thumbs() {
+        // the thumbnails for this view (a virtual list used to ask for them as it drew)
+        let px = view.icon_px();
+        for (i, r) in rows.iter().enumerate() {
+            if r.thumb == -2 {
+                if let Some(tx) = TX.get() {
+                    let path = r.target.clone().unwrap_or_else(|| dir.join(&r.name));
+                    let _ = tx.send((GEN.load(Relaxed), i, path, px));
+                }
+            }
+        }
+    }
+}
+
 fn reset_thumbs() {
     GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let himl = ST.with_borrow(|st| st.himl);
@@ -1537,13 +1581,22 @@ fn ensure_iml(list: HWND, px: i32) {
 /// Applies a view mode to the list without reloading the folder (also used when a folder's saved view is restored).
 fn apply_view(list: HWND, view: ViewMode) {
     ui::row_height(list, view == ViewMode::Details);
-    match view {
-        ViewMode::Details => { put(list, LVM_SETVIEW, LV_VIEW_DETAILS as usize, 0); unsafe { ui::fit_filler(list) }; }
-        ViewMode::List => { put(list, LVM_SETVIEW, LV_VIEW_LIST as usize, 0); }
-        ViewMode::Small => { put(list, LVM_SETVIEW, LV_VIEW_SMALLICON as usize, 0); }
-        ViewMode::Medium | ViewMode::Large | ViewMode::ExtraLarge => { ensure_iml(list, view.icon_px()); put(list, LVM_SETVIEW, LV_VIEW_ICON as usize, 0); }
-        ViewMode::Tiles => { ensure_iml(list, 48); put(list, LVM_SETVIEW, LV_VIEW_TILE as usize, 0); }
+    if view.icon_px() > 16 { ensure_iml(list, view.icon_px()); }
+    // an owner-data list ignores LVM_SETVIEW (it only hides the header): the view is the window style's type bits.
+    // Icon views also need LVS_AUTOARRANGE, or the control leaves every virtual item at the same spot.
+    let auto = !matches!(view, ViewMode::Details | ViewMode::List);
+    let ty = match view {
+        ViewMode::Details => LVS_REPORT,
+        ViewMode::List => LVS_LIST,
+        ViewMode::Small => LVS_SMALLICON,
+        _ => LVS_ICON, // the icon sizes and tiles differ by the image list
+    } | if auto { LVS_AUTOARRANGE } else { 0 };
+    unsafe {
+        let style = GetWindowLongPtrW(list, GWL_STYLE) as u32;
+        SetWindowLongPtrW(list, GWL_STYLE, ((style & !(LVS_TYPEMASK | LVS_AUTOARRANGE)) | ty) as isize);
+        SetWindowPos(list, ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     }
+    if view == ViewMode::Details { unsafe { ui::fit_filler(list) } }
 }
 
 /// Details, list, the four icon sizes or tiles (the View menu and Ctrl+wheel).
@@ -1576,11 +1629,30 @@ fn sort_now(h: HWND, c: usize, asc: bool) {
         st.rows = visible_rows(&st.all);
         st.rows.len()
     });
+    let _ = n;
     reset_thumbs();
+    // the rows just changed: refill, then put the selection back on the same names
+    let sel: Vec<String> = ST.with_borrow(|st| {
+        let list = st.list;
+        (0..st.rows.len()).filter(|&i| put(list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) as u32 & LVIS_SELECTED != 0).map(|i| st.rows[i].name.clone()).collect()
+    });
+    fill_items();
+    if !sel.is_empty() {
+        ST.with_borrow(|st| {
+            let list = st.list;
+            for (i, r) in st.rows.iter().enumerate() {
+                if sel.iter().any(|n| n == &r.name) {
+                    let mut it: LVITEMW = unsafe { std::mem::zeroed() };
+                    it.state = LVIS_SELECTED;
+                    it.stateMask = LVIS_SELECTED;
+                    put(list, LVM_SETITEMSTATE, i, &it as *const _ as isize);
+                }
+            }
+        });
+    }
     let list = ST.with_borrow(|st| st.list);
-    put(list, LVM_REDRAWITEMS, 0, n as isize - 1);
     let hdr = put(list, LVM_GETHEADER, 0, 0) as HWND;
-    if !hdr.is_null() { unsafe { InvalidateRect(hdr, ptr::null(), 0) }; }
+    unsafe { if !hdr.is_null() { InvalidateRect(hdr, ptr::null(), 0); } }
     unsafe { ui::status_dirty(h) };
     save_current_view();
 }
@@ -1612,10 +1684,9 @@ fn select_all(h: HWND, invert: bool) {
 }
 
 fn toggle_checkboxes() {
+    CHECK_BOXES.fetch_xor(true, Relaxed);
     let list = ST.with_borrow(|st| st.list);
-    let ex = put(list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) as isize;
-    let bit = LVS_EX_CHECKBOXES as isize;
-    put(list, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_CHECKBOXES as usize, if ex & bit != 0 { ex & !bit } else { ex | bit });
+    unsafe { InvalidateRect(list, ptr::null(), 0) };
 }
 
 fn duplicate_tab(h: HWND, i: usize) {
@@ -2639,7 +2710,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     SendMessageW(search, 0x1501, 1, w(&cue).as_ptr() as isize); // EM_SETCUEBANNER
                 }
                 let view = if desk() { LVS_ICON } else { LVS_REPORT };
-                let list = CreateWindowExW(0, w("SysListView32").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | view | if desk() { 0 } else { LVS_OWNERDATA } | LVS_EDITLABELS | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS, 0, 0, 0, 0, h, 0 as _, inst, ptr::null());
+                // real items, not a virtual list: the control lays icon views out only for items it owns (fill_items)
+                let list = CreateWindowExW(0, w("SysListView32").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | view | LVS_EDITLABELS | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS, 0, 0, 0, 0, h, 0 as _, inst, ptr::null());
                 put(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP) as isize);
                 let mut fi: SHFILEINFOW = std::mem::zeroed();
                 let il = SHGetFileInfoW(w("C:\\").as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
@@ -2842,13 +2914,16 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     96 => {
                         COMPACT.fetch_xor(true, Relaxed);
                         save_globals();
-                        let (list, n) = ST.with_borrow(|st| (st.list, st.rows.len()));
-                        ui::row_height(list, !THUMBS.load(Relaxed));
-                        put(list, LVM_SETVIEW, LV_VIEW_LIST as usize, 0); // the row height is measured again only by a view change
-                        put(list, LVM_SETVIEW, LV_VIEW_DETAILS as usize, 0);
-                        put(list, LVM_SETITEMCOUNT, n, 0);
-                        put(list, LVM_REDRAWITEMS, 0, n as isize - 1);
-                        InvalidateRect(list, ptr::null(), 0);
+                        // the row height is measured again only by a view change; icon views are left alone
+                        if ST.with_borrow(|st| st.view) == ViewMode::Details {
+                            let (list, n) = ST.with_borrow(|st| (st.list, st.rows.len()));
+                            ui::row_height(list, true);
+                            put(list, LVM_SETVIEW, LV_VIEW_LIST as usize, 0);
+                            put(list, LVM_SETVIEW, LV_VIEW_DETAILS as usize, 0);
+                            fill_items();
+                            put(list, LVM_REDRAWITEMS, 0, n as isize - 1);
+                            InvalidateRect(list, ptr::null(), 0);
+                        }
                     }
                     20 => { if let Some(p) = ui::nav_path(lp as usize) { load(h, p); } } // a folder in the left pane
                     21 => { if let Some(p) = ui::crumb_path(lp as usize) { load(h, p); } } // a part of the path in the address pill
@@ -2941,8 +3016,23 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         if let Some((p, is_dir)) = hit { activate(h, p, is_dir); }
                     }
                     NM_CLICK if nm.hwndFrom == list => {
+                        let a = &*(lp as *const NMITEMACTIVATE);
+                        let i = a.iItem;
+                        // the item check box, at the head of the name column
+                        if CHECK_BOXES.load(Relaxed) && ST.with_borrow(|st| st.view) == ViewMode::Details {
+                            let mut r: RECT = std::mem::zeroed();
+                            r.left = LVIR_BOUNDS as i32;
+                            let ok = i >= 0 && put(list, LVM_GETITEMRECT, i as usize, &mut r as *mut _ as isize) != 0;
+                            let inside = ok && a.ptAction.x >= r.left + ui::sc(6) && a.ptAction.x <= r.left + ui::sc(24);
+                            if inside {
+                                if let Some(name) = ST.with_borrow(|st| st.rows.get(i as usize).filter(|r| !r.hdr).map(|r| r.name.clone())) {
+                                    tick(&name);
+                                    InvalidateRect(list, ptr::null(), 0);
+                                }
+                                return 0;
+                            }
+                        }
                         // a group heading: fold its rows away, or bring them back
-                        let i = (*(lp as *const NMITEMACTIVATE)).iItem;
                         if let Some(label) = ST.with_borrow(|st| st.rows.get(i as usize).filter(|r| r.hdr).map(|r| r.name[1..].to_string())) {
                             toggle_group(h, &label);
                         }
@@ -3151,11 +3241,20 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             }
             WM_THUMB => {
                 let (era, row, bmp) = *Box::from_raw(wp as *mut (u32, usize, isize));
-                let (list, himl) = ST.with_borrow(|st| (st.list, st.himl));
+                let (list, himl, thumbs) = ST.with_borrow(|st| (st.list, st.himl, st.view.wants_thumbs()));
                 if era == GEN.load(std::sync::atomic::Ordering::Relaxed) {
                     let idx = ImageList_Add(himl as _, bmp as _, ptr::null_mut());
                     let ok = idx >= 0 && ST.with_borrow_mut(|st| st.rows.get_mut(row).map(|r| r.thumb = idx).is_some());
-                    if ok { put(list, LVM_REDRAWITEMS, row, row as isize); }
+                    if ok && thumbs {
+                        let mut it: LVITEMW = std::mem::zeroed();
+                        it.mask = LVIF_IMAGE;
+                        it.iItem = row as i32;
+                        it.iImage = idx;
+                        put(list, LVM_SETITEMW, 0, &it as *const _ as isize);
+                        put(list, LVM_UPDATE, row, 0);
+                    } else if ok {
+                        put(list, LVM_REDRAWITEMS, row, row as isize);
+                    }
                 }
                 windows_sys::Win32::Graphics::Gdi::DeleteObject(bmp as _);
                 0
