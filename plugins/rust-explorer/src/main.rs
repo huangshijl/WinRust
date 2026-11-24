@@ -196,9 +196,9 @@ impl Hist {
     fn forward(&mut self) -> Option<PathBuf> { if self.pos + 1 < self.v.len() { self.pos += 1; Some(self.v[self.pos].clone()) } else { None } }
 }
 
-struct State { list: HWND, tab: HWND, edit: HWND, search: HWND, dir: PathBuf, rows: Vec<Row>, all: Vec<Row>, thumbs: bool, tiles: bool, tile_starts: Vec<(String, usize)>, tile_bands: Vec<(String, i32)>, view: ViewMode, himl: isize, iml_px: i32, tabs: Vec<PathBuf>, active: usize, hist: Hist, closed: Vec<PathBuf> }
+struct State { list: HWND, tab: HWND, edit: HWND, search: HWND, dir: PathBuf, rows: Vec<Row>, all: Vec<Row>, thumbs: bool, tiles: bool, tile_starts: Vec<(String, usize)>, tile_bands: Vec<(String, i32, bool)>, tile_collapsed: Vec<bool>, view: ViewMode, himl: isize, iml_px: i32, tabs: Vec<PathBuf>, active: usize, hist: Hist, closed: Vec<PathBuf> }
 thread_local! {
-    static ST: RefCell<State> = RefCell::new(State { list: 0 as _, tab: 0 as _, edit: 0 as _, search: 0 as _, dir: PathBuf::new(), rows: vec![], all: vec![], thumbs: false, tiles: false, tile_starts: vec![], tile_bands: vec![], view: ViewMode::Details, himl: 0, iml_px: 96, tabs: vec![], active: 0, hist: Hist { v: vec![], pos: 0 }, closed: vec![] });
+    static ST: RefCell<State> = RefCell::new(State { list: 0 as _, tab: 0 as _, edit: 0 as _, search: 0 as _, dir: PathBuf::new(), rows: vec![], all: vec![], thumbs: false, tiles: false, tile_starts: vec![], tile_bands: vec![], tile_collapsed: vec![], view: ViewMode::Details, himl: 0, iml_px: 96, tabs: vec![], active: 0, hist: Hist { v: vec![], pos: 0 }, closed: vec![] });
     static COLLAPSED: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new()); // group headings the user collapsed
 }
 static SORT_COL: AtomicUsize = AtomicUsize::new(0); // 0 name, 1 size, 2 modified
@@ -1308,7 +1308,7 @@ fn load(h: HWND, dir: PathBuf) {
             if n > nf { v.push((tf!("Устройства и диски ({})", "Devices and drives ({})", ja: "デバイスとドライブ ({})", pt: "Dispositivos e unidades ({})", zh: "设备和驱动器 ({})", n - nf), nf)); }
             v
         });
-        ST.with_borrow_mut(|st| st.tile_starts = heads);
+        ST.with_borrow_mut(|st| { st.tile_starts = heads; st.tile_collapsed = vec![false; st.tile_starts.len()]; });
     }
     let shown_dir = page_name(&dir).map_or_else(|| dir.to_string_lossy().into_owned(), str::to_string);
     unsafe { SetWindowTextW(edit, w(&shown_dir).as_ptr()) };
@@ -1469,13 +1469,20 @@ pub(crate) fn tile_layout(list: HWND) {
     let (cw, _) = unsafe { let mut r: RECT = std::mem::zeroed(); GetClientRect(list, &mut r); (r.right, r.bottom) };
     let (cell_w, cell_h, head_h, pad) = (ui::sc(330), ui::sc(84), ui::sc(40), ui::sc(14));
     let cols = ((cw - 2 * pad) / cell_w).max(1);
-    let starts = ST.with_borrow(|st| st.tile_starts.clone());
+    let starts = ST.with_borrow(|st| (st.tile_starts.clone(), st.tile_collapsed.clone()));
+    let (starts, folded) = starts;
     let n = put(list, LVM_GETITEMCOUNT, 0, 0) as usize;
     let (mut y, mut bands) = (pad, Vec::new());
     for (si, (title, at)) in starts.iter().enumerate() {
         let end = starts.get(si + 1).map_or(n, |s| s.1).min(n);
-        bands.push((title.clone(), y));
+        let closed = folded.get(si).copied().unwrap_or(false);
+        bands.push((title.clone(), y, closed));
         y += head_h;
+        if closed {
+            // stacked under their heading and skipped when drawn: no far-away cells (those would add a scrollbar)
+            for k in *at..end { put(list, LVM_SETITEMPOSITION, k, ((pad as isize) & 0xFFFF) | (((y - head_h) as isize) << 16)); }
+            continue;
+        }
         let mut col = 0;
         for k in *at..end {
             let x = pad + col * cell_w;
@@ -1488,8 +1495,70 @@ pub(crate) fn tile_layout(list: HWND) {
         }
         if col != 0 { y += cell_h; }
     }
-    let _ = cell_h;
     ST.with_borrow_mut(|st| st.tile_bands = bands);
+}
+
+/// The tile page is up (Home / This PC).
+pub(crate) fn tiles_active() -> bool { ST.with_borrow(|st| st.tiles && st.view == ViewMode::Tiles) }
+
+/// True when the item sits in a folded section: neither drawn nor hit.
+pub(crate) fn tile_item_hidden(i: usize) -> bool {
+    ST.with_borrow(|st| {
+        let n = st.rows.len();
+        st.tile_starts.iter().enumerate().any(|(k, (_, at))| {
+            let end = st.tile_starts.get(k + 1).map_or(n, |s| s.1);
+            st.tile_collapsed.get(k).copied().unwrap_or(false) && i >= *at && i < end
+        })
+    })
+}
+
+/// Item under a client point of the list, measured against the tile cells.
+pub(crate) fn tile_at(list: HWND, x: i32, y: i32) -> Option<usize> {
+    if !tiles_active() { return None; }
+    let n = put(list, LVM_GETITEMCOUNT, 0, 0) as usize;
+    let (cw, chh) = (ui::sc(330), ui::sc(84));
+    for i in 0..n {
+        if tile_item_hidden(i) { continue; }
+        let mut p: POINT = unsafe { std::mem::zeroed() };
+        if put(list, LVM_GETITEMPOSITION, i, &mut p as *mut _ as isize) == 0 || p.x < 0 { continue; }
+        if x >= p.x && x < p.x + cw && y >= p.y && y < p.y + chh { return Some(i); }
+    }
+    None
+}
+
+/// Selects one tile (a click on the wide part of the cell that the control's own hit test misses).
+pub(crate) fn tile_select(list: HWND, i: usize) {
+    unsafe { SetFocus(list) };
+    let mut it: LVITEMW = unsafe { std::mem::zeroed() };
+    it.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+    it.state = LVIS_SELECTED | LVIS_FOCUSED;
+    put(list, LVM_SETITEMSTATE, usize::MAX, &it as *const _ as isize);
+    put(list, LVM_SETITEMSTATE, i, &it as *const _ as isize);
+}
+
+/// A click on a section heading: folds that section.
+pub(crate) fn tile_toggle_at(list: HWND, x: i32, y: i32) -> bool {
+    if !tiles_active() { return false; }
+    let head_h = ui::sc(40);
+    let k = ST.with_borrow(|st| st.tile_bands.iter().position(|(_, by, _)| y >= *by && y < by + head_h && x >= ui::sc(6)));
+    let Some(k) = k else { return false };
+    ST.with_borrow_mut(|st| { if let Some(c) = st.tile_collapsed.get_mut(k) { *c = !*c; } });
+    tile_layout(list);
+    unsafe { InvalidateRect(list, ptr::null(), 0) };
+    true
+}
+
+/// Opens the row like a double click does.
+pub(crate) fn open_row(h: HWND, i: usize) {
+    let hit = ST.with_borrow(|st| st.rows.get(i).filter(|r| !r.hdr).map(|r| (r.target.clone().unwrap_or_else(|| st.dir.join(&r.name)), r.dir)));
+    if let Some((p, is_dir)) = hit { unsafe { activate(h, p, is_dir) }; }
+}
+
+/// The item menu of one row (a right click on the wide part of a tile).
+pub(crate) fn row_menu(h: HWND, i: usize) {
+    let hit = ST.with_borrow(|st| st.rows.get(i).filter(|r| !r.hdr).map(|r| (st.dir.clone(), r.target.clone().unwrap_or_else(|| st.dir.join(&r.name)))));
+    let Some((dir, p)) = hit else { return };
+    if dir.to_string_lossy() == "::recycle" { unsafe { recycle_menu(h) } } else { item_menu(h, &dir, &[p]) }
 }
 
 fn reset_thumbs() {
@@ -2008,6 +2077,18 @@ mod sh {
             }
         });
         tx
+    }
+
+    /// A px x px shell image of a file, folder or drive (the icon, not a thumbnail), 32-bit with alpha. 0 on failure.
+    pub fn tile_image(p: &Path, px: i32) -> isize {
+        unsafe {
+            let file = p.to_path_buf();
+            let Ok(f) = SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(PCWSTR(wide(&file).as_ptr()), None) else { return 0 };
+            let Ok(bmp) = f.GetImage(SIZE { cx: px, cy: px }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK) else { return 0 };
+            let padded = pad(bmp.0, px);
+            windows_sys::Win32::Graphics::Gdi::DeleteObject(bmp.0 as _);
+            padded as isize
+        }
     }
 
     /// Centers `src` (any size up to t, 32-bit with alpha) on a transparent t x t bitmap: ImageList_Add needs exact sizes.

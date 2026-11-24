@@ -298,9 +298,9 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             let bands = ST.with_borrow(|s| s.tile_bands.clone());
             let (f_head, f_ch) = (font(13, 600, ui_face()) as HFONT, font(11, 400, winrust_common::style::icon_face()) as HFONT);
             SetBkMode(dc, TRANSPARENT as i32);
-            for (title, y) in bands {
+            for (title, y, closed) in bands {
                 SelectObject(dc, f_ch);
-                text(dc, "\u{E70D}", rc(sc(14), y + sc(8), sc(30), y + sc(30)), pal().dim, DT_CENTER);
+                text(dc, if closed { "\u{E76C}" } else { "\u{E70D}" }, rc(sc(14), y + sc(8), sc(30), y + sc(30)), pal().dim, DT_CENTER);
                 SelectObject(dc, f_head);
                 text(dc, &title, rc(sc(34), y + sc(8), cr.right - sc(14), y + sc(30)), pal().text, DT_LEFT);
                 fill(dc, rc(sc(14), y + sc(32), cr.right - sc(14), y + sc(33)), pal().line, 0);
@@ -354,6 +354,7 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
         CDDS_ITEMPREPAINT if tiles => {
             // a wide tile: the icon on the left, the name on the right and, for a drive, how full it is
             let i = cd.nmcd.dwItemSpec;
+            if crate::tile_item_hidden(i as usize) { return CDRF_SKIPDEFAULT as isize; }
             let row = ST.with(|c| {
                 let mut st = c.try_borrow_mut().ok()?;
                 let State { dir, rows, .. } = &mut *st;
@@ -362,7 +363,7 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
                 if r.icon < 0 { r.icon = icon_of(&actual, r.dir); }
                 Some((r.name.clone(), r.dir, r.target.clone(), actual))
             });
-            let Some((name, is_dir, target, actual)) = row else { return CDRF_SKIPDEFAULT as isize };
+            let Some((name, _is_dir, target, actual)) = row else { return CDRF_SKIPDEFAULT as isize };
             let mut p: POINT = std::mem::zeroed();
             if SendMessageW(list, LVM_GETITEMPOSITION, i as usize, &mut p as *mut _ as isize) == 0 { return CDRF_SKIPDEFAULT as isize; }
             // a paint can arrive before the tile layout has placed the item: skip nonsense coordinates
@@ -373,11 +374,8 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             let hot = ROWHOT.get() == i as isize;
             if sel { fill(dc, cell, pal().sel, sc(8)); } else if hot { fill(dc, cell, pal().row_hover, sc(8)); }
             let ipx = sc(48);
-            let hicon = tile_icon(&actual, is_dir);
-            if hicon != 0 {
-                DrawIconEx(dc, p.x + sc(12), p.y + (chh - ipx) / 2, hicon as _, ipx, ipx, 0, ptr::null_mut(), DI_NORMAL);
-                DestroyIcon(hicon as _);
-            }
+            let bmp = tile_bitmap(&actual);
+            if bmp != 0 { draw_tile_bitmap(dc, bmp, p.x + sc(12), p.y + (chh - ipx) / 2, ipx); }
             if FONTS.get().0 == 0 { FONTS.set((font(13, 400, ui_face()), font(12, 400, ui_face()))); }
             let (f_name, f_det) = FONTS.get();
             SetBkMode(dc, TRANSPARENT as i32);
@@ -530,12 +528,36 @@ unsafe fn redraw_row(list: HWND, i: isize) {
 /// Column header, drawn by hand: bar colour, white / dim title, a sort arrow on the sorted column. The header reports its
 /// custom draw to its parent, the list, so the hook sits on the list.
 unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    // tile pages: the cells are wider than the control's item rects, so hover and clicks come from our own hit test
+    if crate::tiles_active() {
+        let pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+        match m {
+            WM_MOUSEMOVE => {
+                let i = crate::tile_at(h, pt.x, pt.y).map_or(-1, |i| i as isize);
+                if ROWHOT.replace(i) != i { InvalidateRect(h, ptr::null(), 0); }
+                let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
+                TrackMouseEvent(&mut tme);
+                return 0;
+            }
+            WM_LBUTTONDOWN => {
+                if crate::tile_toggle_at(h, pt.x, pt.y) { return 0; }
+                if let Some(i) = crate::tile_at(h, pt.x, pt.y) { crate::tile_select(h, i); return 0; }
+            }
+            WM_LBUTTONDBLCLK => {
+                if let Some(i) = crate::tile_at(h, pt.x, pt.y) { crate::open_row(GetAncestor(h, GA_ROOT), i); return 0; }
+            }
+            WM_RBUTTONDOWN => {
+                if let Some(i) = crate::tile_at(h, pt.x, pt.y) { crate::tile_select(h, i); crate::row_menu(GetAncestor(h, GA_ROOT), i); return 0; }
+            }
+            _ => {}
+        }
+    }
     if m == WM_MOUSEWHEEL && GetKeyState(VK_CONTROL as i32) < 0 {
         let d = ((wp >> 16) & 0xFFFF) as i16;
         if d != 0 { PostMessageW(GetAncestor(h, GA_ROOT), WM_UI, 87, if d > 0 { 1 } else { -1 }); }
         return 0;
     }
-    if m == WM_MOUSEMOVE {
+    if m == WM_MOUSEMOVE && !crate::tiles_active() {
         // hover row for list_draw
         let mut ht: LVHITTESTINFO = std::mem::zeroed();
         ht.pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
@@ -1544,16 +1566,26 @@ pub fn drive_list() -> Vec<DriveInfo> {
     out
 }
 
-/// The shell's large icon for a tile (32 px from the shell, drawn stretched to 48).
-unsafe fn tile_icon(p: &Path, dir: bool) -> isize {
-    let mut fi: SHFILEINFOW = std::mem::zeroed();
-    let s = p.to_string_lossy();
-    let drive = s.len() == 3 && s.ends_with(":\\");
-    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let own = drive || (!dir && matches!(ext.as_str(), "exe" | "lnk" | "ico" | "url" | "scr"));
-    let attr = if dir { 0x10 } else { 0x80 };
-    SHGetFileInfoW(w(&s).as_ptr(), attr, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | if own { 0 } else { SHGFI_USEFILEATTRIBUTES });
-    fi.hIcon as isize
+/// A 48 px shell icon for a tile (the shell renders it at that size, so no stretching), cached per path.
+fn tile_bitmap(p: &Path) -> isize {
+    thread_local! { static TILE_ICONS: RefCell<HashMap<PathBuf, isize>> = RefCell::new(HashMap::new()); }
+    TILE_ICONS.with(|c| {
+        let mut m = c.borrow_mut();
+        if let Some(&b) = m.get(p) { return b; }
+        let b = crate::sh::tile_image(p, sc(48));
+        m.insert(p.to_path_buf(), b);
+        b
+    })
+}
+
+/// Draws such a bitmap at (x, y), `px` square.
+unsafe fn draw_tile_bitmap(dc: HDC, bmp: isize, x: i32, y: i32, px: i32) {
+    let mem = CreateCompatibleDC(dc);
+    let old = SelectObject(mem, bmp as HGDIOBJ);
+    let bf = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+    AlphaBlend(dc, x, y, px, px, mem, 0, 0, px, px, bf);
+    SelectObject(mem, old);
+    DeleteDC(mem);
 }
 
 /// Free and total bytes of a drive root, None for anything else.
