@@ -19,12 +19,13 @@
 #![windows_subsystem = "windows"]
 use std::{cell::RefCell, env, fs, os::windows::fs::MetadataExt, path::{Path, PathBuf}, ptr, sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed}};
 use winrust_common::{t, tf};
-use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{GetStockObject, InvalidateRect}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetCapture, GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT}, Shell::*, WindowsAndMessaging::*}};
+use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{GetStockObject, InvalidateRect, ScreenToClient}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetCapture, GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT}, Shell::*, WindowsAndMessaging::*}};
 
 mod zipx; // our own ZIP engine (deflate, inflate, container)
 mod jobs; // our own copier, ZIP packer, ZIP/7z unpacker (background, progress in the status line)
 mod shellwin; // registers the window as a shell window: "Show in folder" from other apps selects the file
 mod ctxmenu; // the Win11-style multi-column context menu (shell items laid out to the right of the click)
+mod fileops; // copy / move / delete: queue, progress window, conflicts, undo
 mod ui; // the look: palette, painted tabs / toolbar / address pill / status line, dark theme
 
 static DESKTOP: AtomicBool = AtomicBool::new(false);
@@ -452,15 +453,13 @@ fn select_edit(name: &str) {
     }
 }
 
-/// Pastes what is on the system clipboard (files copied or cut here or in any other file manager).
-/// Copies and moves to another drive run in our own copier (jobs.rs: parallel on SSDs, unbuffered for big files); moves on the
-/// same drive (a rename), shell items, and folders that need elevation go through the shell.
+/// Pastes what is on the system clipboard (files copied or cut here or in any other file manager). Real folders go through
+/// our own engine (queue, progress window, conflicts, undo); a folder that needs elevation is left to the shell.
 fn paste(h: HWND, dir: &PathBuf) {
     if is_virtual(dir) || zipx::split_zip(dir).is_some() { return; }
     let Some((paths, cut)) = sh::clip_get() else { return };
-    let fast = jobs::can_fast_copy(&paths, dir) && !(cut && paths.iter().all(|p| jobs::same_volume(p, dir))) && jobs::writable(dir);
-    if fast && !jobs::busy() {
-        jobs::copy(h as isize, paths, dir.clone(), cut);
+    if jobs::writable(dir) {
+        fileops::submit(h, if cut { fileops::Kind::Move } else { fileops::Kind::Copy }, paths, dir.clone());
     } else {
         let _ = sh::fileop(h, if cut { sh::Op::Move } else { sh::Op::Copy }, &paths, dir);
     }
@@ -582,7 +581,7 @@ fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
     // the shell menu has no Rename here (it needs the shell's own folder view to answer it): the same edit box as F2
     if paths.len() == 1 { extra.push((MENU_RENAME, t!("Переименовать", "Rename", ja: "名前の変更", pt: "Renomear", zh: "重命名"))); }
     if let [p] = paths { if p.is_dir() { extra.push((MENU_PIN, if ui::pins().contains(p) { t!("Открепить от быстрого доступа", "Unpin from Quick access", ja: "クイック アクセスからピン留めを解除", pt: "Desafixar do Acesso rápido", zh: "从快速访问取消固定") } else { t!("Закрепить в быстром доступе", "Pin to Quick access", ja: "クイック アクセスにピン留め", pt: "Fixar no Acesso rápido", zh: "固定到快速访问") })); } }
-    let picked = sh::show(h, paths, if jobs::busy() { &[] } else { &extra }).ok().flatten();
+    let picked = sh::show(h, paths, if jobs::busy() || fileops::busy() { &[] } else { &extra }).ok().flatten();
     match picked {
         Some(MENU_PIN) => ui::toggle_pin(&paths[0]),
         Some(MENU_RENAME) => unsafe {
@@ -622,6 +621,91 @@ fn set_icons_hidden(hide: bool) {
     if hide { if let Some(d) = m.parent() { let _ = fs::create_dir_all(d); } let _ = fs::write(&m, "1"); } else { let _ = fs::remove_file(&m); }
     let list = ST.with_borrow(|st| st.list);
     unsafe { ShowWindow(list, if hide { SW_HIDE } else { SW_SHOW }) };
+}
+
+static DRAG_DIR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// While a drag hovers near the top / bottom of the list, scroll it (WM_TIMER 11 does the work).
+pub fn drag_scroll_at(root: HWND, x: i32, y: i32) -> i32 {
+    unsafe {
+        let list = ST.with_borrow(|st| st.list);
+        let mut lr = RECT::default();
+        if GetWindowRect(list, &mut lr) == 0 { return 0; }
+        let mut o = POINT { x: lr.left, y: lr.top };
+        ScreenToClient(root, &mut o);
+        let h = lr.bottom - lr.top;
+        let ly = y - o.y;
+        if x < o.x || x >= o.x + (lr.right - lr.left) || ly < 0 || ly >= h { return 0; }
+        let edge = ui::sc(30);
+        if ly < edge { -1 } else if ly > h - edge { 1 } else { 0 }
+    }
+}
+
+pub fn drag_scroll_stop(h: HWND) {
+    DRAG_DIR.store(0, Relaxed);
+    unsafe { KillTimer(h, 11); }
+}
+
+/// Where a drag would land: the shown folder, a folder under the pointer, or nowhere (a virtual page).
+pub enum DropPlace { Here, Folder(PathBuf), No }
+
+/// Resolves a drag's screen point: a folder row, the navigation pane, a tab, or a part of the address pill.
+pub fn drop_place_at(root: HWND, x: i32, y: i32) -> DropPlace {
+    unsafe {
+        let mut c = POINT { x, y };
+        ScreenToClient(root, &mut c);
+        let (list, dir, tabs) = ST.with_borrow(|st| (st.list, st.dir.clone(), st.tabs.clone()));
+        let mut lr = RECT::default();
+        if GetWindowRect(list, &mut lr) != 0 {
+            let mut o = POINT { x: lr.left, y: lr.top };
+            ScreenToClient(root, &mut o);
+            let mut lc = RECT::default();
+            GetClientRect(list, &mut lc);
+            let p = POINT { x: c.x - o.x, y: c.y - o.y };
+            if p.x >= 0 && p.y >= 0 && p.x < lc.right && p.y < lc.bottom {
+                let mut ht: LVHITTESTINFO = std::mem::zeroed();
+                ht.pt = p;
+                let i = put(list, LVM_HITTEST, 0, &mut ht as *mut _ as isize);
+                let row = usize::try_from(i).ok().and_then(|i| ST.with_borrow(|st| st.rows.get(i).cloned()));
+                if let Some(r) = row.filter(|r| !r.hdr && r.dir) {
+                    let p = r.target.clone().unwrap_or_else(|| dir.join(&r.name));
+                    let s = p.to_string_lossy();
+                    if s.starts_with("::") { return DropPlace::No; }
+                    if p.is_dir() { return DropPlace::Folder(p); }
+                }
+                return DropPlace::Here;
+            }
+        }
+        let nav = ui::nav_hwnd();
+        if !nav.is_null() {
+            let mut nr = RECT::default();
+            if GetWindowRect(nav, &mut nr) != 0 {
+                let mut o = POINT { x: nr.left, y: nr.top };
+                ScreenToClient(root, &mut o);
+                if c.x >= o.x && c.y >= o.y && c.x < o.x + (nr.right - nr.left) && c.y < o.y + (nr.bottom - nr.top) {
+                    return match ui::nav_target_at(c.x - o.x, c.y - o.y) {
+                        Some(p) if p.to_string_lossy().starts_with("::") => DropPlace::No,
+                        Some(p) if p.is_dir() => DropPlace::Folder(p),
+                        _ => DropPlace::Here,
+                    };
+                }
+            }
+        }
+        if c.y < ui::sc(ui::CHROME_H) {
+            let mut cr = RECT::default();
+            GetClientRect(root, &mut cr);
+            if let Some(i) = ui::tab_at(cr.right, tabs.len(), c.x, c.y) {
+                return match tabs.get(i) {
+                    Some(p) if p.is_dir() && !p.to_string_lossy().starts_with("::") => DropPlace::Folder(p.clone()),
+                    Some(_) => DropPlace::No,
+                    None => DropPlace::Here,
+                };
+            }
+            if let Some(p) = ui::crumb_path_at(c.x, c.y) { return DropPlace::Folder(p); }
+            return DropPlace::Here;
+        }
+        DropPlace::Here
+    }
 }
 
 /// Right click on empty space: the folder's own menu.
@@ -945,6 +1029,23 @@ fn recycle_restore_one(h: HWND, target: &Path, origin: &Path, dir: bool) -> bool
             true
         }
         Err(e) => { warn(h, &format!("{}: {e}", dest.display())); false }
+    }
+}
+
+/// Undo of a delete: puts `original` back from the Recycle Bin (the newest record for that path).
+fn recycle_restore_original(h: HWND, original: &Path) -> bool {
+    let want = original.to_string_lossy();
+    let mut best: Option<Row> = None;
+    for r in recycle_rows() {
+        let same = r.origin.as_ref().is_some_and(|o| o.to_string_lossy().eq_ignore_ascii_case(&want));
+        if same && best.as_ref().is_none_or(|b| r.time > b.time) { best = Some(r); }
+    }
+    match best {
+        Some(r) => match (r.target, r.origin) {
+            (Some(t), Some(o)) => recycle_restore_one(h, &t, &o, r.dir),
+            _ => false,
+        },
+        None => false,
     }
 }
 
@@ -1556,11 +1657,11 @@ mod wall {
 
 /// Shell integration through COM (windows crate): file operations, context menu, drag and drop.
 mod sh {
-    use std::{cell::RefCell, ffi::c_void, os::windows::ffi::OsStrExt, path::PathBuf};
+    use std::{cell::RefCell, ffi::c_void, os::windows::ffi::OsStrExt, path::{Path, PathBuf}, sync::Mutex};
     use windows::{core::*, Win32::{Foundation::*, System::{Com::*, DataExchange::RegisterClipboardFormatW, Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock}, Ole::*, SystemServices::MODIFIERKEYS_FLAGS}, UI::{Shell::{Common::ITEMIDLIST, *}, WindowsAndMessaging::*}}};
 
     #[derive(Clone, Copy)]
-    pub enum Op { Copy, Move, Delete }
+    pub enum Op { Copy, Move }
 
     /// [user Desktop, public Desktop] (the user one may be redirected, e.g. to OneDrive).
     pub fn desktop_dirs() -> Vec<PathBuf> {
@@ -1591,17 +1692,28 @@ mod sh {
         unsafe {
             let fo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
             fo.SetOwnerWindow(HWND(h))?;
-            fo.SetOperationFlags(if matches!(op, Op::Delete) { FOF_ALLOWUNDO } else { FOF_RENAMEONCOLLISION })?;
+            fo.SetOperationFlags(FOF_RENAMEONCOLLISION)?;
             let item = |p: &PathBuf| SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide(p).as_ptr()), None);
-            let dest = if matches!(op, Op::Delete) { None } else { Some(item(to)?) };
+            let dest = item(to)?;
             for p in from {
                 let it = item(p)?;
-                match (op, &dest) {
-                    (Op::Copy, Some(d)) => fo.CopyItem(&it, d, PCWSTR::null(), None)?,
-                    (Op::Move, Some(d)) => fo.MoveItem(&it, d, PCWSTR::null(), None)?,
-                    _ => fo.DeleteItem(&it, None)?,
+                match op {
+                    Op::Copy => fo.CopyItem(&it, &dest, PCWSTR::null(), None)?,
+                    Op::Move => fo.MoveItem(&it, &dest, PCWSTR::null(), None)?,
                 }
             }
+            fo.PerformOperations()
+        }
+    }
+
+    /// Delete to the Recycle Bin without the shell's own dialogs: our progress window and summary are the UI.
+    pub fn recycle_silent(h: *mut core::ffi::c_void, paths: &[PathBuf]) -> Result<()> {
+        unsafe {
+            let fo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
+            fo.SetOwnerWindow(HWND(h))?;
+            fo.SetOperationFlags(FOF_ALLOWUNDO | FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI)?;
+            let item = |p: &PathBuf| SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide(p).as_ptr()), None);
+            for p in paths { fo.DeleteItem(&item(p)?, None)?; }
             fo.PerformOperations()
         }
     }
@@ -1944,7 +2056,19 @@ mod sh {
                 DestroyMenu(menu)?;
                 return Ok(Some(id));
             }
-            if id > 0 { invoke(&cm, hwnd, id as i32, pt)?; }
+            if id > 0 {
+                let mut verb = [0u16; 64];
+                let delete = cm.GetCommandString(id as usize - 1, GCS_VERBW, None, PSTR(verb.as_mut_ptr() as *mut u8), verb.len() as u32).is_ok() && {
+                    let k = verb.iter().position(|&c| c == 0).unwrap_or(0);
+                    String::from_utf16_lossy(&verb[..k]).eq_ignore_ascii_case("delete")
+                };
+                if delete && !super::cur_virtual() {
+                    let _ = super::fileops::delete(h, paths.to_vec(), false);
+                    DestroyMenu(menu)?;
+                    return Ok(None);
+                }
+                invoke(&cm, hwnd, id as i32, pt)?;
+            }
             DestroyMenu(menu)?;
             Ok(None)
         }
@@ -2002,14 +2126,55 @@ mod sh {
     }
 
     #[implement(IDropTarget)]
-    struct DropT { main: isize }
+    struct DropT { main: isize, paths: Mutex<Vec<PathBuf>>, to: Mutex<Option<PathBuf>> }
 
-    fn effect(k: MODIFIERKEYS_FLAGS) -> DROPEFFECT { if k.0 & 8 != 0 { DROPEFFECT_COPY } else { DROPEFFECT_MOVE } } // 8 = MK_CONTROL
+    fn place(main: isize, pt: &POINTL) -> Option<PathBuf> {
+        match super::drop_place_at(main as *mut core::ffi::c_void, pt.x, pt.y) {
+            super::DropPlace::Folder(p) => Some(p),
+            super::DropPlace::Here => Some(super::cur_dir()),
+            super::DropPlace::No => None,
+        }
+    }
+
+    fn effect(k: MODIFIERKEYS_FLAGS, from: &[PathBuf], to: Option<&PathBuf>) -> DROPEFFECT {
+        let Some(to) = to else { return DROPEFFECT_NONE };
+        if to.to_string_lossy().starts_with("::") || super::in_zip() { return DROPEFFECT_NONE; }
+        if from.iter().any(|p| to.starts_with(p)) { return DROPEFFECT_NONE; } // a folder into itself
+        let volume = |p: &Path| p.components().next().map(|c| c.as_os_str().to_string_lossy().to_lowercase());
+        // like Explorer: same drive moves, other drive copies; Ctrl copies, Shift moves
+        if k.0 & 8 != 0 { DROPEFFECT_COPY }
+        else if k.0 & 4 != 0 { DROPEFFECT_MOVE }
+        else if from.first().and_then(|p| volume(p)) == volume(to) { DROPEFFECT_MOVE }
+        else { DROPEFFECT_COPY }
+    }
 
     impl IDropTarget_Impl for DropT_Impl {
-        fn DragEnter(&self, _o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, _pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> { unsafe { *e = if super::in_zip() { DROPEFFECT_NONE } else { effect(k) } }; Ok(()) }
-        fn DragOver(&self, k: MODIFIERKEYS_FLAGS, _pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> { unsafe { *e = if super::in_zip() { DROPEFFECT_NONE } else { effect(k) } }; Ok(()) }
-        fn DragLeave(&self) -> Result<()> { Ok(()) }
+        fn DragEnter(&self, o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
+            let paths = match o.ok() { Ok(o) => hdrop_paths(&o).unwrap_or_default(), Err(_) => Vec::new() };
+            let to = place(self.main, pt);
+            *self.paths.lock().unwrap() = paths.clone();
+            *self.to.lock().unwrap() = to.clone();
+            unsafe { *e = effect(k, &paths, to.as_ref()) };
+            Ok(())
+        }
+        fn DragOver(&self, k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
+            let to = place(self.main, pt);
+            *self.to.lock().unwrap() = to.clone();
+            let paths = self.paths.lock().unwrap().clone();
+            unsafe { *e = effect(k, &paths, to.as_ref()) };
+            let d = super::drag_scroll_at(self.main as *mut core::ffi::c_void, pt.x, pt.y);
+            super::DRAG_DIR.store(d, std::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                let h = HWND(self.main as *mut core::ffi::c_void);
+                if d != 0 { SetTimer(Some(h), 11, 70, None); } else { let _ = KillTimer(Some(h), 11); }
+            }
+            Ok(())
+        }
+        fn DragLeave(&self) -> Result<()> {
+            *self.to.lock().unwrap() = None;
+            super::drag_scroll_stop(self.main as *mut core::ffi::c_void);
+            Ok(())
+        }
         fn Drop(&self, o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
             if super::desk::dragging() {
                 // desktop icons dropped back on the desktop: a move of the icons, not of the files (the dragger finishes it)
@@ -2017,23 +2182,25 @@ mod sh {
                 unsafe { *e = DROPEFFECT_NONE };
                 return Ok(());
             }
-            if super::in_zip() { // nothing can be dropped into an archive here
-                unsafe { *e = DROPEFFECT_NONE };
-                return Ok(());
-            }
             let paths = hdrop_paths(o.ok()?)?;
-            let to = super::cur_dir();
-            // like Explorer: same drive moves, other drive copies, Ctrl forces copy
-            let copy = k.0 & 8 != 0 || paths.first().and_then(|p| p.components().next()) != to.components().next();
-            unsafe { *e = if copy { DROPEFFECT_COPY } else { DROPEFFECT_MOVE } };
-            let _ = fileop(self.main as *mut c_void, if copy { Op::Copy } else { Op::Move }, &paths, &to);
-            unsafe { let _ = PostMessageW(Some(HWND(self.main as *mut c_void)), WM_APP, WPARAM(0), LPARAM(0)); }
+            let to = place(self.main, pt);
+            let eff = effect(k, &paths, to.as_ref());
+            unsafe { *e = eff };
+            super::drag_scroll_stop(self.main as *mut core::ffi::c_void);
+            let Some(to) = to.filter(|_| eff != DROPEFFECT_NONE) else { return Ok(()) };
+            let copy = eff == DROPEFFECT_COPY;
+            if super::jobs::writable(&to) {
+                super::fileops::submit(self.main as *mut core::ffi::c_void, if copy { super::fileops::Kind::Copy } else { super::fileops::Kind::Move }, paths, to);
+            } else {
+                let _ = fileop(self.main as *mut core::ffi::c_void, if copy { Op::Copy } else { Op::Move }, &paths, &to);
+                unsafe { let _ = PostMessageW(Some(HWND(self.main as *mut core::ffi::c_void)), WM_APP, WPARAM(0), LPARAM(0)); }
+            }
             Ok(())
         }
     }
 
     pub fn register_drop(list: *mut c_void, main: isize) -> Result<()> {
-        let t: IDropTarget = DropT { main }.into();
+        let t: IDropTarget = DropT { main, paths: Mutex::new(vec![]), to: Mutex::new(None) }.into();
         unsafe { RegisterDragDrop(HWND(list), &t) }
     }
 }
@@ -2427,6 +2594,12 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 ST.with_borrow_mut(|st| { st.list = list; st.tab = tab; st.edit = edit; st.search = search; st.tabs = vec![PathBuf::new()]; });
                 if !desk() { ui::place_edit(tab); }
                 let _ = sh::register_drop(list as _, h as isize);
+                if !desk() {
+                    let _ = sh::register_drop(tab as _, h as isize); // tabs, address pill
+                    let nav = ui::nav_hwnd();
+                    if !nav.is_null() { let _ = sh::register_drop(nav as _, h as isize); }
+                    let _ = sh::register_drop(h as _, h as isize); // status strip / window edges
+                }
                 if desk() && icons_hidden() { ShowWindow(list, SW_HIDE); }
                 // live wallpaper: the list is see-through (colour key), so over empty desktop OLE finds the wallpaper window under it,
                 // and walks up from there to the desktop window: it must accept the drop too
@@ -2494,7 +2667,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
                                 if i >= 0 { SetFocus(list); put(list, LVM_EDITLABELW, i as usize, 0); }
                             }
-                            14 if !paths.is_empty() && !in_zip() && !cur_virtual() => { let _ = sh::fileop(h, sh::Op::Delete, &paths, &dir); reload(h); }
+                            14 if !paths.is_empty() && !in_zip() && !cur_virtual() => { let _ = fileops::delete(h, paths, false); }
                             15 if !cur_virtual() => create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true),
                             _ => {}
                         }
@@ -2729,8 +2902,10 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         let (list, dir, paths) = selected();
                         match vk {
                             0x08 => if let Some(p) = dir.parent() { load(h, p.to_path_buf()) },
+                            0x1B if fileops::busy() => { fileops::cancel_all(); return 0; } // Esc stops copying / moving / deleting
                             0x1B if jobs::busy() => { jobs::cancel(); return 0; } // Esc stops packing / unpacking
-                            0x2E if !paths.is_empty() && !in_zip() && !cur_virtual() => { let _ = sh::fileop(h, sh::Op::Delete, &paths, &dir); }
+                            0x2E if !paths.is_empty() && !in_zip() && !cur_virtual() => { let _ = fileops::delete(h, paths, shift); }
+                            0x5A if ctrl => { fileops::undo(h); return 0; }
                             // Space: a quick look. Pictures open in photoview, videos / text / anything else in its default app
                             0x20 if !desk() => if let Some(p) = paths.first().filter(|p| p.is_file()) { activate(h, p.clone(), false); },
                             0x71 if !in_zip() && !cur_virtual() => {
@@ -2812,10 +2987,18 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_SETFOCUS => { SetFocus(ST.with_borrow(|st| st.list)); 0 }
             WM_APP => { reload(h); 0 }
             WM_REFRESH if !desk() => { SetTimer(h, 9, 300, None); 0 } // debounce bursts of changes
+            WM_TIMER if !desk() && wp == 11 => {
+                let d = DRAG_DIR.load(Relaxed);
+                if d != 0 {
+                    let list = ST.with_borrow(|st| st.list);
+                    put(list, LVM_SCROLL, 0, (d * ui::sc(26)) as isize);
+                }
+                0
+            }
             WM_TIMER if !desk() && wp == 9 => {
                 let list = ST.with_borrow(|st| st.list);
                 let editing = SendMessageW(list, LVM_GETEDITCONTROL, 0, 0) as HWND;
-                if jobs::busy() || GetCapture() != 0 as HWND || !editing.is_null() {
+                if jobs::busy() || fileops::busy() || GetCapture() != 0 as HWND || !editing.is_null() {
                     SetTimer(h, 9, 500, None);
                 } else {
                     KillTimer(h, 9);
@@ -2824,6 +3007,12 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             shellwin::WM_SHELL_SELECT => { shell_select(h as isize, *Box::from_raw(lp as *mut PathBuf)); 0 }
+            fileops::WM_FILEOPS_DONE => {
+                let report = *Box::from_raw(wp as *mut fileops::Report);
+                fileops::finished(h, report);
+                0
+            }
+            fileops::WM_FILEOPS_CONFLICT => { fileops::conflict(h, lp as *mut fileops::Conflict); 0 }
             WM_JOB => {
                 let err = *Box::from_raw(wp as *mut Option<String>);
                 reload(h);
@@ -2888,7 +3077,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_CONTEXTMENU if desk() && icons_hidden() => { bg_menu(h); 0 }
             desk::SPAWN_WORKERW if desk() => { desk::spawn_workerw(h); 0 }
             WM_TIMER if desk() && wp == 7 => { desk::check_live(ST.with_borrow(|st| st.list)); 0 }
-            WM_DESTROY => { if !desk() { save_place(h); } shellwin::revoke(); PostQuitMessage(0); 0 }
+            WM_DESTROY => { if !desk() { save_place(h); } fileops::shutdown(h); shellwin::revoke(); PostQuitMessage(0); 0 }
             _ => DefWindowProcW(h, m, wp, lp),
         }
     }

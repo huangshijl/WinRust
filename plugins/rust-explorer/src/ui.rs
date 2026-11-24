@@ -1422,6 +1422,22 @@ pub fn nav_sync(dir: &Path) {
     nav_dirty();
 }
 
+pub fn nav_hwnd() -> HWND { NAVWND.with(|c| c.get()) as HWND }
+
+/// The path of the navigation row under (x, y): a real folder or a virtual page.
+pub fn nav_target_at(_x: i32, y: i32) -> Option<PathBuf> {
+    nav_row_at(y).and_then(nav_path)
+}
+
+/// The tab under (x, y) in the chrome, and the path part of the address pill.
+pub fn tab_at(cw: i32, n: usize, x: i32, y: i32) -> Option<usize> {
+    layout(cw, n).tabs.iter().position(|t| inside(t, x, y))
+}
+
+pub fn crumb_path_at(x: i32, y: i32) -> Option<PathBuf> {
+    crumb_at(x, y).and_then(crumb_path).filter(|p| p.is_dir() && !p.to_string_lossy().starts_with("::"))
+}
+
 pub fn nav_path(i: usize) -> Option<PathBuf> {
     NAV.with_borrow(|n| n.get(i).map(|x| x.path.clone()).filter(|p| !p.as_os_str().is_empty()))
 }

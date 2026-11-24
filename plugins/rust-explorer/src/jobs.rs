@@ -1,6 +1,6 @@
-//! Background file jobs, faster than the shell's: copying (several files at once on SSDs, unbuffered I/O for big files),
-//! ZIP packing (files compressed on all cores, by our own deflate) and unpacking ZIP / 7z. Progress shows in the status line (`status_text`),
-//! the end comes to the window as WM_JOB.
+//! Background jobs: ZIP packing (files compressed on all cores, by our own deflate) and unpacking ZIP / 7z. Progress shows
+//! in the status line (`status_text`), the end comes to the window as WM_JOB. Copying lives in fileops.rs (queue, conflicts,
+//! progress window, undo); the tree walk and name helpers here are shared with it.
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -97,7 +97,7 @@ fn spawn(h: isize, what: String, f: impl FnOnce(&Progress) -> Result<(), String>
 type Entry = (PathBuf, PathBuf, Option<u64>);
 
 /// Everything under `src`, folders before their contents. Links and junctions to folders are not followed (no loops).
-fn walk(src: &Path, rel: PathBuf, out: &mut Vec<Entry>) -> std::io::Result<()> {
+pub(crate) fn walk(src: &Path, rel: PathBuf, out: &mut Vec<Entry>) -> std::io::Result<()> {
     let md = fs::symlink_metadata(src)?;
     if md.is_dir() {
         out.push((src.to_path_buf(), rel.clone(), None));
@@ -122,11 +122,6 @@ pub fn free_name(dir: &Path, name: &str, is_dir: bool) -> PathBuf {
     (1..).map(|n| dir.join(if n == 1 { name.to_string() } else { format!("{stem} ({n}){ext}") })).find(|p| fs::symlink_metadata(p).is_err()).unwrap()
 }
 
-/// Plain paths on a drive (not shell items like a phone or a library), and the destination not inside a source.
-pub fn can_fast_copy(from: &[PathBuf], to: &Path) -> bool {
-    to.is_dir() && to.has_root() && !from.is_empty() && from.iter().all(|p| p.has_root() && fs::symlink_metadata(p).is_ok() && !to.starts_with(p))
-}
-
 /// The destination accepts new files without elevation (otherwise the shell copy asks for it).
 pub fn writable(dir: &Path) -> bool {
     let t = dir.join(format!(".winrust-{}.tmp", std::process::id()));
@@ -139,100 +134,6 @@ pub fn writable(dir: &Path) -> bool {
 pub fn same_volume(a: &Path, b: &Path) -> bool {
     let root = |p: &Path| p.components().next().map(|c| c.as_os_str().to_string_lossy().to_lowercase());
     root(a).is_some() && root(a) == root(b)
-}
-
-// ---------- copying ----------
-
-/// Whether the volume of `p` is a spinning disk (seeking costs time: copy one file at a time there).
-fn seek_penalty(p: &Path) -> bool {
-    use windows_sys::Win32::{Foundation::*, Storage::FileSystem::*, System::{IO::DeviceIoControl, Ioctl::*}};
-    let Some(letter) = p.to_string_lossy().chars().next().filter(|c| c.is_ascii_alphabetic()) else { return false };
-    let dev: Vec<u16> = format!(r"\\.\{letter}:").encode_utf16().chain([0]).collect();
-    unsafe {
-        let h = CreateFileW(dev.as_ptr(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut());
-        if h == INVALID_HANDLE_VALUE {
-            return false;
-        }
-        let q = STORAGE_PROPERTY_QUERY { PropertyId: StorageDeviceSeekPenaltyProperty, QueryType: PropertyStandardQuery, AdditionalParameters: [0] };
-        let mut d: DEVICE_SEEK_PENALTY_DESCRIPTOR = std::mem::zeroed();
-        let mut n = 0u32;
-        let ok = DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q as *const _ as _, size_of::<STORAGE_PROPERTY_QUERY>() as u32, &mut d as *mut _ as _, size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32, &mut n, std::ptr::null_mut()) != 0;
-        CloseHandle(h);
-        ok && d.IncursSeekPenalty
-    }
-}
-
-const BIG: u64 = 256 << 20;
-
-/// CopyFileExW; big files without the cache (faster for them, and they do not push everything else out of memory).
-fn copy_file(src: &Path, dst: &Path, size: u64, p: &Progress) -> std::io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{COPY_FILE_FAIL_IF_EXISTS, COPY_FILE_NO_BUFFERING, CopyFileExW};
-    unsafe extern "system" fn cb(_total: i64, done: i64, _st: i64, _sd: i64, _id: u32, _r: u32, _s: *mut core::ffi::c_void, _d: *mut core::ffi::c_void, data: *const core::ffi::c_void) -> u32 {
-        let (prog, last) = unsafe { &mut *(data as *mut (&Progress, u64)) };
-        prog.bytes.fetch_add(done as u64 - *last, Relaxed);
-        *last = done as u64;
-        0 // PROGRESS_CONTINUE
-    }
-    let w = |p: &Path| -> Vec<u16> { std::os::windows::ffi::OsStrExt::encode_wide(p.as_os_str()).chain([0]).collect() };
-    let mut state: (&Progress, u64) = (p, 0);
-    let flags = COPY_FILE_FAIL_IF_EXISTS | if size >= BIG { COPY_FILE_NO_BUFFERING } else { 0 };
-    let ok = unsafe { CopyFileExW(w(src).as_ptr(), w(dst).as_ptr(), Some(cb), &mut state as *mut _ as _, std::ptr::null_mut(), flags) } != 0;
-    p.bytes.fetch_add(size.saturating_sub(state.1), Relaxed); // empty files and anything the callback did not report
-    if ok { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-}
-
-/// Copies `from` into `to` (names that exist there get " (2)"); `then_delete` = a move across drives: the sources go away
-/// only when every file arrived.
-pub fn copy(h: isize, from: Vec<PathBuf>, to: PathBuf, then_delete: bool) -> bool {
-    let what = if then_delete { t!("Перемещение", "Moving", ja: "移動中", pt: "Movendo", zh: "正在移动") } else { t!("Копирование", "Copying", ja: "コピー中", pt: "Copiando", zh: "正在复制") }.to_string();
-    spawn(h, what, move |p| copy_now(&from, &to, then_delete, p))
-}
-
-fn copy_now(from: &[PathBuf], to: &Path, then_delete: bool, p: &Progress) -> Result<(), String> {
-    let mut entries = vec![];
-    for src in from {
-        let name = src.file_name().ok_or_else(|| format!("{}: no name", src.display()))?.to_string_lossy().into_owned();
-        let top = free_name(to, &name, src.is_dir());
-        walk(src, PathBuf::from(top.file_name().unwrap()), &mut entries).map_err(|e| format!("{}: {e}", src.display()))?;
-    }
-    p.total_files.store(entries.iter().filter(|e| e.2.is_some()).count() as u64, Relaxed);
-    p.total_bytes.store(entries.iter().filter_map(|e| e.2).sum(), Relaxed);
-    for (_, rel, size) in &entries {
-        if size.is_none() {
-            fs::create_dir_all(to.join(rel)).map_err(|e| format!("{}: {e}", to.join(rel).display()))?;
-        }
-    }
-    let mut files: Vec<&Entry> = entries.iter().filter(|e| e.2.is_some()).collect();
-    files.sort_by_key(|e| std::cmp::Reverse(e.2)); // big ones first: the small ones fill the gaps at the end
-    let threads = if seek_penalty(&from[0]) || seek_penalty(to) { 1 } else { std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8) };
-    let next = AtomicU64::new(0);
-    let errors: Mutex<Vec<String>> = Mutex::new(vec![]);
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                while let Some(e) = files.get(next.fetch_add(1, Relaxed) as usize) {
-                    let dst = to.join(&e.1);
-                    match copy_file(&e.0, &dst, e.2.unwrap(), p) {
-                        Ok(()) => _ = p.files.fetch_add(1, Relaxed),
-                        Err(err) => errors.lock().unwrap().push(format!("{}: {err}", e.0.display())),
-                    }
-                }
-            });
-        }
-    });
-    let errors = errors.into_inner().unwrap();
-    if !errors.is_empty() {
-        let more = if errors.len() > 5 { format!("\n... and {} more", errors.len() - 5) } else { String::new() };
-        let kept = if then_delete { "\nNothing was deleted from the source." } else { "" };
-        return Err(format!("{} file(s) were not copied:\n{}{more}{kept}", errors.len(), errors[..errors.len().min(5)].join("\n")));
-    }
-    if then_delete {
-        for src in from {
-            let r = if fs::symlink_metadata(src).is_ok_and(|m| m.is_dir()) { fs::remove_dir_all(src) } else { fs::remove_file(src) };
-            r.map_err(|e| format!("Copied, but {} could not be removed: {e}", src.display()))?;
-        }
-    }
-    Ok(())
 }
 
 // ---------- ZIP / 7z ----------
@@ -376,25 +277,6 @@ mod tests {
     }
 
     #[test]
-    fn copies_a_tree_and_moves_it() {
-        let d = tmp("copy");
-        tree(&d);
-        fs::create_dir(d.join("dst")).unwrap();
-        let p = Progress::new(String::new());
-        copy_now(&[d.join("src")], &d.join("dst"), false, &p).unwrap();
-        assert_eq!(fs::read_to_string(d.join("dst/src/one.txt")).unwrap(), "hello");
-        assert_eq!(fs::read(d.join("dst/src/a/two.bin")).unwrap().len(), 300_000);
-        assert!(d.join("dst/src/a/b/empty").is_file());
-        assert_eq!((p.files.load(Relaxed), p.total_files.load(Relaxed)), (3, 3));
-        assert_eq!(p.bytes.load(Relaxed), p.total_bytes.load(Relaxed));
-        // again: the existing name gets " (2)", and as a move the source goes away
-        copy_now(&[d.join("src")], &d.join("dst"), true, &Progress::new(String::new())).unwrap();
-        assert!(d.join("dst/src (2)/a/two.bin").is_file() && !d.join("src").exists());
-        assert!(!can_fast_copy(&[d.join("dst")], &d.join("dst/src")), "into itself");
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
     fn zip_round_trip() {
         let d = tmp("zip");
         tree(&d);
@@ -508,46 +390,6 @@ mod tests {
         println!("LIVE compared {} files x 3 unpackers, {bad} mismatches", files.iter().filter(|e| e.2.is_some()).count());
         let _ = fs::remove_dir_all(&d);
         assert_eq!(bad, 0);
-    }
-
-    /// Old path (IFileOperation, Explorer's engine) against ours on the same data. By hand:
-    /// `set RX_BENCH=<empty dir on the disk to test>` and `cargo test -p rust-explorer --release bench -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn bench() {
-        let Some(root) = std::env::var_os("RX_BENCH").map(PathBuf::from) else { return };
-        let small = root.join("small");
-        fs::create_dir_all(&small).unwrap();
-        for i in 0..5000 {
-            fs::write(small.join(format!("f{i}.bin")), vec![(i % 251) as u8; 4096 + (i * 37) % 60_000]).unwrap();
-        }
-        let big = root.join("big");
-        fs::create_dir_all(&big).unwrap();
-        let chunk: Vec<u8> = (0..1u32 << 20).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
-        let mut f = fs::File::create(big.join("1gb.bin")).unwrap();
-        for _ in 0..1024 {
-            std::io::Write::write_all(&mut f, &chunk).unwrap();
-        }
-        drop(f);
-        super::super::sh::init();
-        for src in [&small, &big] {
-            let dst_old = root.join("out-old");
-            let dst_new = root.join("out-new");
-            let _ = fs::remove_dir_all(&dst_old);
-            let _ = fs::remove_dir_all(&dst_new);
-            fs::create_dir_all(&dst_old).unwrap();
-            fs::create_dir_all(&dst_new).unwrap();
-            let t = Instant::now();
-            super::super::sh::fileop(std::ptr::null_mut(), super::super::sh::Op::Copy, &[src.clone()], &dst_old).unwrap();
-            let old = t.elapsed();
-            let t = Instant::now();
-            copy_now(&[src.clone()], &dst_new, false, &Progress::new(String::new())).unwrap();
-            let new = t.elapsed();
-            println!("BENCH copy {}: IFileOperation {:.2} s, ours {:.2} s", src.file_name().unwrap().to_string_lossy(), old.as_secs_f64(), new.as_secs_f64());
-        }
-        let t = Instant::now();
-        zip_now(&[small.clone()], &root.join("ours.zip"), &Progress::new(String::new())).unwrap();
-        println!("BENCH zip small: ours {:.2} s", t.elapsed().as_secs_f64());
     }
 
     #[test]
