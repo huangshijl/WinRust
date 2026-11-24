@@ -28,8 +28,9 @@ const RELOAD: i32 = 4;
 const SEARCH: i32 = 5;
 const VIEW: i32 = 6;
 const PLUS: i32 = 7;
-const CMD: i32 = 10; // + 0..5: cut, copy, paste, rename, delete (Windows 11 command buttons)
-const CMD_GLYPHS: [&str; 5] = ["\u{E8C6}", "\u{E8C8}", "\u{E77F}", "\u{E8AC}", "\u{E74D}"];
+const CMD: i32 = 10; // + index into CMD_ACTIONS / CMD_GLYPHS
+const CMD_ACTIONS: [usize; 6] = [15, 10, 11, 12, 13, 14]; // new folder, cut, copy, paste, rename, delete
+const CMD_GLYPHS: [&str; 6] = ["\u{E8F4}", "\u{E8C6}", "\u{E8C8}", "\u{E77F}", "\u{E8AC}", "\u{E74D}"];
 const TAB: i32 = 100; // + index
 const CLOSE: i32 = 200; // + index
 const CRUMB: i32 = 400; // + index: a part of the path in the address pill
@@ -419,7 +420,7 @@ fn layout(cw: i32, n: usize) -> Layout {
     let search = rc(view.left - sc(4) - bs, by0, view.left - sc(4), by1);
     let reload = btn(3);
     // command buttons only while the address pill keeps a usable width
-    let cmds: Vec<RECT> = if cw >= sc(900) { (4..9).map(btn).collect() } else { vec![] };
+    let cmds: Vec<RECT> = if cw >= sc(900) { (4..10).map(btn).collect() } else { vec![] };
     let pill = rc(cmds.last().unwrap_or(&reload).right + sc(8), by0, search.left - sc(8), by1);
     Layout { tabs, close, plus, back: btn(0), fwd: btn(1), up: btn(2), reload, pill, search, view, cmds }
 }
@@ -579,7 +580,8 @@ unsafe fn paint_chrome(hwnd: HWND) {
         let (t, b) = (l.pill.top + sc(5), l.pill.bottom - sc(5));
         if let Some(q) = &searching {
             SelectObject(dc, f_txt);
-            text(dc, &format!("Results for \u{201C}{q}\u{201D}"), rc(x0 + sc(6), l.pill.top, x1, l.pill.bottom), pal().accent, DT_LEFT);
+            let title = tf!("Результаты по запросу «{}»", "Results for \u{201C}{}\u{201D}", ja: "「{}」の検索結果", pt: "Resultados de \u{201C}{}\u{201D}", zh: "“{}”的搜索结果", q);
+            text(dc, &title, rc(x0 + sc(6), l.pill.top, x1, l.pill.bottom), pal().accent, DT_LEFT);
         } else {
             let parts = crumbs_of(&dir);
             let width = |s: &str| { let mut r = rc(0, 0, 0, 0); DrawTextW(dc, w(s).as_ptr(), -1, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX); r.right + sc(16) };
@@ -724,7 +726,7 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             PRESS.set((k, now()));
             InvalidateRect(h, ptr::null(), 0);
             let (act, idx) = match k {
-                k if (CMD..CMD + 5).contains(&k) => (k as usize - CMD as usize + 10, 0), BACK => (4, 0), FWD => (5, 0), UP => (6, 0), RELOAD => (7, 0), SEARCH => (9, 0), VIEW => (8, 0), PLUS => (3, 0),
+                k if (CMD..CMD + CMD_GLYPHS.len() as i32).contains(&k) => (CMD_ACTIONS[(k - CMD) as usize], 0), BACK => (4, 0), FWD => (5, 0), UP => (6, 0), RELOAD => (7, 0), SEARCH => (9, 0), VIEW => (8, 0), PLUS => (3, 0),
                 k if k >= CLOSE => (2, (k - CLOSE) as isize),
                 k => (if m == WM_MBUTTONDOWN { 2 } else { 1 }, (k - TAB) as isize), // middle click on a tab closes it
             };
@@ -742,18 +744,6 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             SetBkColor(dc, pill());
             if BRUSH.get() == 0 { BRUSH.set(CreateSolidBrush(pill()) as isize); }
             return BRUSH.get();
-        }
-        WM_RBUTTONUP => {
-            // right click on a pinned folder: unpin it
-            if let Some(p) = nav_hit(y).and_then(nav_path).filter(|p| pins().contains(p)) {
-                let menu = CreatePopupMenu();
-                AppendMenuW(menu, MF_STRING, 1, w(t!("Открепить от быстрого доступа", "Unpin from Quick access", ja: "クイック アクセスからピン留めを解除", pt: "Desafixar do Acesso rápido", zh: "从快速访问取消固定")).as_ptr());
-                let mut pt: POINT = std::mem::zeroed();
-                GetCursorPos(&mut pt);
-                let id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
-                DestroyMenu(menu);
-                if id == 1 { toggle_pin(&p); }
-            }
         }
         _ => return DefWindowProcW(h, m, wp, lp),
     }
@@ -932,7 +922,8 @@ unsafe fn paint_nav(hwnd: HWND) {
                 fill(dc, rc(bar.left, bar.top, bar.left + fw.max(sc(4)), bar.bottom), if used > 0.9 { winrust_common::style::BAD } else { pal().accent }, sc(4));
                 SelectObject(dc, f_small);
                 let gb = |b: u64| b as f64 / 1_073_741_824.0;
-                text(dc, &format!("{:.0} GB free of {:.0} GB", gb(free), gb(total)), rc(bar.left, bar.bottom + sc(1), r.right - sc(8), y + hgt - sc(2)), pal().dim, DT_LEFT);
+                let free_total = tf!("{:.0} ГБ свободно из {:.0} ГБ", "{:.0} GB free of {:.0} GB", ja: "{:.0} GB 空き / {:.0} GB", pt: "{:.0} GB livres de {:.0} GB", zh: "{:.0} GB 可用，共 {:.0} GB", gb(free), gb(total));
+                text(dc, &free_total, rc(bar.left, bar.bottom + sc(1), r.right - sc(8), y + hgt - sc(2)), pal().dim, DT_LEFT);
             }
             y += hgt;
         }
@@ -961,6 +952,20 @@ pub unsafe extern "system" fn nav_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
             if NAVHOT.replace(k) != k { InvalidateRect(h, ptr::null(), 0); }
         }
         WM_MOUSELEAVE => { NAVHOT.set(-1); InvalidateRect(h, ptr::null(), 0); }
+        WM_RBUTTONUP => {
+            // a folder in the pane: pin / unpin it, or show its properties
+            if let Some(p) = nav_hit(y).and_then(nav_path) {
+                let menu = CreatePopupMenu();
+                let pin = if pins().contains(&p) { t!("Открепить от быстрого доступа", "Unpin from Quick access", ja: "クイック アクセスからピン留めを解除", pt: "Desafixar do Acesso rápido", zh: "从快速访问取消固定") } else { t!("Закрепить в быстром доступе", "Pin to Quick access", ja: "クイック アクセスにピン留め", pt: "Fixar no Acesso rápido", zh: "固定到快速访问") };
+                AppendMenuW(menu, MF_STRING, 1, w(pin).as_ptr());
+                AppendMenuW(menu, MF_STRING, 2, w(t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性")).as_ptr());
+                let mut pt: POINT = std::mem::zeroed();
+                GetCursorPos(&mut pt);
+                let id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
+                DestroyMenu(menu);
+                match id { 1 => toggle_pin(&p), 2 => crate::properties(&p), _ => {} }
+            }
+        }
         WM_LBUTTONDOWN => {
             if let Some(i) = nav_hit(y) {
                 PRESS.set((5000 + i as i32, now()));

@@ -1,9 +1,9 @@
 //! Code shared by the WinRust programs: the language switch (`t!`, `tf!`, `lang!`, `en!`), the NTFS MFT reader, Win+D.
 //! Use it with `#[macro_use] extern crate winrust_common;` at the crate root.
 //!
-//! English by default; Russian, Japanese, Portuguese (Brazil) or Simplified Chinese when %ProgramData%\WinRust\lang.txt
-//! contains "ru", "ja", "pt" or "zh" (the language list in the installer and in rust-settings writes it).
-//! Programs read the file once at start; the one that flips the switch updates its own texts at once.
+//! The Windows display language by default; Russian, Japanese, Portuguese (Brazil) or Simplified Chinese when
+//! %ProgramData%\WinRust\lang.txt contains "ru", "ja", "pt" or "zh" (the language list in the installer and in
+//! rust-settings writes it). Programs read it once at start; the one that flips the switch updates its own texts at once.
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicU8, Ordering::Relaxed},
@@ -45,7 +45,7 @@ pub fn reveal(path: &str) {
     };
 }
 
-/// The UI languages. English by default; the choice lives in %ProgramData%\WinRust\lang.txt.
+/// The UI languages. The Windows display language by default; the choice lives in %ProgramData%\WinRust\lang.txt.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lang {
     En,
@@ -98,6 +98,19 @@ fn file() -> Option<PathBuf> {
     std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("lang.txt"))
 }
 
+/// What a fresh install gets before anyone picks a language: the Windows display language, English for the rest.
+fn system_lang() -> Lang {
+    use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
+    let primary = unsafe { GetUserDefaultUILanguage() } as u32 & 0x3FF;
+    match primary {
+        0x19 => Lang::Ru,
+        0x11 => Lang::Ja,
+        0x16 => Lang::Pt,
+        0x04 => Lang::Zh,
+        _ => Lang::En,
+    }
+}
+
 /// The current language at run time. In code that has unit tests use `lang!()` instead: it is always Russian under `cargo test`.
 pub fn lang() -> Lang {
     match LANG.load(Relaxed) {
@@ -107,7 +120,7 @@ pub fn lang() -> Lang {
         3 => Lang::Pt,
         4 => Lang::Zh,
         _ => {
-            let l = file().and_then(|f| std::fs::read_to_string(f).ok()).map_or(Lang::En, |s| Lang::parse(&s));
+            let l = file().and_then(|f| std::fs::read_to_string(f).ok()).map_or_else(system_lang, |s| Lang::parse(&s));
             LANG.store(l as u8, Relaxed);
             l
         }

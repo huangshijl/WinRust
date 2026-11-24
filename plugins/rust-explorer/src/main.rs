@@ -249,11 +249,42 @@ fn properties(path: &PathBuf) {
 }
 
 /// New folder / new empty file with a free name ("New folder", "New folder (2)", ...).
-fn new_entry(dir: &PathBuf, base: &str, folder: bool) {
-    if zipx::split_zip(dir).is_some() { return; }
+fn new_entry(dir: &PathBuf, base: &str, folder: bool) -> Result<PathBuf, String> {
+    if zipx::split_zip(dir).is_some() {
+        return Err(t!("Архив открыт только для чтения", "An archive is read-only", ja: "アーカイブは読み取り専用です", pt: "Um arquivo é somente leitura", zh: "压缩包在这里是只读的").into());
+    }
     let (stem, ext) = match base.rsplit_once('.') { Some((s, e)) if !folder => (s.to_string(), format!(".{e}")), _ => (base.to_string(), String::new()) };
-    let path = (1..).map(|n| dir.join(if n == 1 { base.to_string() } else { format!("{stem} ({n}){ext}") })).find(|p| !p.exists());
-    if let Some(p) = path { let _ = if folder { fs::create_dir(p) } else { fs::File::create(p).map(drop) }; }
+    let path = (1..).map(|n| dir.join(if n == 1 { base.to_string() } else { format!("{stem} ({n}){ext}") })).find(|p| !p.exists()).ok_or("no free name")?;
+    if folder { fs::create_dir(&path) } else { fs::File::create(&path).map(drop) }.map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Explorer's way: the new row is selected with its name in the rename box, so it is clear it exists and where it went.
+fn create_new(h: HWND, dir: &PathBuf, base: &str, folder: bool) {
+    match new_entry(dir, base, folder) {
+        Ok(p) => {
+            reload(h);
+            let name = p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+            select_edit(&name);
+        }
+        Err(e) => warn(h, &e),
+    }
+}
+
+/// Selects the row called `name` and opens its rename box.
+fn select_edit(name: &str) {
+    let (list, i) = ST.with_borrow(|st| (st.list, st.rows.iter().position(|r| !r.hdr && r.name.eq_ignore_ascii_case(name))));
+    let Some(i) = i else { return };
+    unsafe {
+        let mut it: LVITEMW = std::mem::zeroed();
+        it.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+        put(list, LVM_SETITEMSTATE, usize::MAX, &it as *const _ as isize);
+        it.state = LVIS_SELECTED | LVIS_FOCUSED;
+        put(list, LVM_SETITEMSTATE, i, &it as *const _ as isize);
+        put(list, LVM_ENSUREVISIBLE, i, 0);
+        SetFocus(list);
+        put(list, LVM_EDITLABELW, i, 0);
+    }
 }
 
 /// Pastes what is on the system clipboard (files copied or cut here or in any other file manager).
@@ -487,8 +518,8 @@ unsafe fn bg_menu(h: HWND) {
             let drive: String = dir.to_string_lossy().chars().take(2).collect();
             if let Some(exe) = disk { let _ = std::process::Command::new(exe).arg(drive).spawn(); }
         }
-        1 => new_entry(&dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true),
-        2 => new_entry(&dir, t!("Новый текстовый документ.txt", "New text document.txt", ja: "新しいテキスト ドキュメント.txt", pt: "Novo documento de texto.txt", zh: "新建文本文档.txt"), false),
+        1 => { create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true); return; }
+        2 => { create_new(h, &dir, t!("Новый текстовый документ.txt", "New text document.txt", ja: "新しいテキスト ドキュメント.txt", pt: "Novo documento de texto.txt", zh: "新建文本文档.txt"), false); return; }
         3 => paste(h, &dir),
         5 => properties(&dir),
         _ => {}
@@ -637,6 +668,7 @@ fn load(h: HWND, dir: PathBuf) {
     reset_thumbs();
     put(list, LVM_DELETEALLITEMS, 0, 0);
     if desk() { desk::fill(list, n); } else { put(list, LVM_SETITEMCOUNT, n, 0); }
+    unsafe { ui::status_dirty(h) }; // the counts belong to the folder that was just opened
 }
 
 /// Asks the rust-search service of drive `d` (see plugins/rust-search): terms in, one path per line out.
@@ -1052,6 +1084,34 @@ mod sh {
         unsafe { strip(menu, &name) };
     }
 
+    /// Windows' own "Pin to Quick access" writes Explorer's list, which our pane never reads: our own entry is the one.
+    /// Found by the canonical verbs pintohome / unpinfromhome, with the labels of the five languages as a fallback.
+    unsafe fn hide_shell_pins(cm: &IContextMenu, menu: HMENU) {
+        use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, GetMenuItemCount, GetMenuItemID, GetMenuStringW, MF_BYPOSITION};
+        let labels = ["pin to quick access", "unpin from quick access", "固定到快速访问", "从快速访问取消固定", "закрепить в быстром доступе", "открепить от быстрого доступа", "クイック アクセスにピン留め", "クイック アクセスからピン留めを解除", "fixar no acesso rápido", "desafixar do acesso rápido"];
+        let count = unsafe { GetMenuItemCount(Some(menu)) }.max(0);
+        for i in (0..count).rev() {
+            unsafe {
+                let id = GetMenuItemID(menu, i);
+                if id == 0 || id == u32::MAX { continue; }
+                let mut verb = [0u16; 64];
+                let mut hit = false;
+                if cm.GetCommandString(id as usize - 1, GCS_VERBW, None, PSTR(verb.as_mut_ptr() as *mut u8), verb.len() as u32).is_ok() {
+                    let n = verb.iter().position(|&c| c == 0).unwrap_or(0);
+                    let v = String::from_utf16_lossy(&verb[..n]).to_lowercase();
+                    hit = v == "pintohome" || v == "unpinfromhome";
+                }
+                if !hit {
+                    let mut b = [0u16; 256];
+                    let n = GetMenuStringW(menu, i as u32, Some(&mut b), MF_BYPOSITION);
+                    let t = String::from_utf16_lossy(&b[..n.max(0) as usize]).replace('&', "").to_lowercase();
+                    hit = labels.contains(&t.as_str());
+                }
+                if hit { let _ = DeleteMenu(menu, i as u32, MF_BYPOSITION); }
+            }
+        }
+    }
+
     unsafe extern "system" fn collect(h: HWND, lp: LPARAM) -> BOOL {
         unsafe { (*(lp.0 as *mut Vec<isize>)).push(h.0 as isize); }
         TRUE
@@ -1095,6 +1155,7 @@ mod sh {
             let menu = CreatePopupMenu()?;
             cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL).ok()?;
             hide_system_zip(&cm, menu);
+            hide_shell_pins(&cm, menu);
             if !extra.is_empty() {
                 let _ = InsertMenuW(menu, 0, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
                 for (id, text) in extra.iter().rev() {
@@ -1638,7 +1699,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     7 => reload(h),
                     8 => toggle_view(h),
                     9 => search_focus(),
-                    10..=14 => {
+                    10..=15 => {
                         let (list, dir, paths) = selected();
                         match wp {
                             10 | 11 if !paths.is_empty() => match real_paths(&paths) { Ok(p) => { let _ = sh::clip_set(h, &p, wp == 10 && !in_zip()); } Err(e) => warn(h, &e) },
@@ -1648,6 +1709,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 if i >= 0 { SetFocus(list); put(list, LVM_EDITLABELW, i as usize, 0); }
                             }
                             14 if !paths.is_empty() && !in_zip() => { let _ = sh::fileop(h, sh::Op::Delete, &paths, &dir); reload(h); }
+                            15 => create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true),
                             _ => {}
                         }
                     }
@@ -1718,8 +1780,33 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         if let Some((p, is_dir)) = hit { activate(h, p, is_dir); }
                     }
                     NM_RCLICK if nm.hwndFrom == list => {
-                        let (_, dir, paths) = selected();
-                        if !paths.is_empty() { item_menu(h, &dir, &paths); } else { bg_menu(h); }
+                        // like Explorer: right click selects the row under the pointer (an already selected one keeps the
+                        // whole selection); empty space clears it and gets the folder's own menu
+                        let pt = (*(lp as *const NMLISTVIEW)).ptAction;
+                        let mut ht: LVHITTESTINFO = std::mem::zeroed();
+                        ht.pt = pt;
+                        let hit = put(list, LVM_HITTEST, 0, &mut ht as *mut _ as isize);
+                        let row = usize::try_from(hit).ok().filter(|&i| ST.with_borrow(|st| st.rows.get(i).is_some_and(|r| !r.hdr)));
+                        match row {
+                            Some(i) => {
+                                let mut it: LVITEMW = std::mem::zeroed();
+                                it.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+                                if put(list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) as u32 & LVIS_SELECTED == 0 {
+                                    put(list, LVM_SETITEMSTATE, usize::MAX, &it as *const _ as isize);
+                                    it.state = LVIS_SELECTED | LVIS_FOCUSED;
+                                    put(list, LVM_SETITEMSTATE, i, &it as *const _ as isize);
+                                }
+                                SetFocus(list);
+                                let (_, dir, paths) = selected();
+                                if !paths.is_empty() { item_menu(h, &dir, &paths); }
+                            }
+                            None => {
+                                let mut it: LVITEMW = std::mem::zeroed();
+                                it.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+                                put(list, LVM_SETITEMSTATE, usize::MAX, &it as *const _ as isize);
+                                bg_menu(h);
+                            }
+                        }
                     }
                     LVN_COLUMNCLICK => {
                         let c = (*(lp as *const NMLISTVIEW)).iSubItem as usize;
@@ -1785,7 +1872,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 return 0;
                             }
                             0x56 if ctrl => paste(h, &dir),
-                            0x4E if ctrl => new_entry(&dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true),
+                            0x4E if ctrl => { create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true); return 0; }
                             0x48 if ctrl => { SHOW_HIDDEN.fetch_xor(true, Relaxed); } // Ctrl+H: hidden files
                             0x74 => {} // F5: just the reload below
                             0x4D if ctrl => { toggle_view(h); return 0; } // Ctrl+M: details <-> thumbnails
