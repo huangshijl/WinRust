@@ -876,9 +876,12 @@ unsafe fn paint_chrome(hwnd: HWND) {
         text(dc, &tab_labels[i], rc(t.left + sc(12), t.top, t.right - sc(if tab_labels.len() > 1 { 28 } else { 10 }), t.bottom), if on { pal().text } else { mix(pal().dim, pal().text, th) }, DT_LEFT);
         if on || th > 0.05 {
             let c = l.close[i];
-            glow(dc, CLOSE + i as i32, c, if on { tab_bg() } else { mix(pal().bg, pal().hover, th) }, pal().hover, sc(4), hot == CLOSE + i as i32);
+            let base = if on { tab_bg() } else { mix(pal().bg, pal().hover, th) };
+            let hotc = hot == CLOSE + i as i32;
+            let e = hv(CLOSE + i as i32, hotc);
+            if e > 0.01 { fill(dc, c, mix(base, 0x001C2BC4, e), sc(4)); } // Win11 close red (#C42B1C), no accent flash
             SelectObject(dc, f_small);
-            text(dc, "\u{E711}", c, if hot == CLOSE + i as i32 { pal().text } else { pal().dim }, DT_CENTER);
+            text(dc, "\u{E711}", c, if hotc { 0x00FFFFFF } else { pal().dim }, DT_CENTER);
         }
     }
     glow(dc, PLUS, l.plus, pal().bg, pal().hover, sc(4), hot == PLUS);
@@ -896,7 +899,7 @@ unsafe fn paint_chrome(hwnd: HWND) {
         let e = hv(k, hot == k);
         SelectObject(dc, f_small);
         if k == WCLOSE {
-            if e > 0.01 { fill(dc, r, mix(pal().bg, 0x00C42B1C, e), 0); }
+            if e > 0.01 { fill(dc, r, mix(pal().bg, 0x001C2BC4, e), 0); } // #C42B1C
             text(dc, g, r, mix(pal().text, 0x00FFFFFF, e), DT_CENTER);
         } else {
             if e > 0.01 { fill(dc, r, mix(pal().bg, pal().hover, e), 0); }
@@ -1179,21 +1182,6 @@ unsafe fn more_menu(h: HWND, at: RECT) {
     if id != 0 { PostMessageW(GetParent(h), WM_UI, id as usize, 0); }
 }
 
-/// The gear's menu: preferences that are not view options. Grows as more of them appear.
-unsafe fn settings_menu(h: HWND, at: RECT) {
-    let items = vec![ctxmenu::Item {
-        id: 1,
-        text: t!("Показывать занятость дисков в области переходов", "Show drive usage in the navigation pane", ja: "ナビゲーション ウィンドウにドライブの使用量を表示", pt: "Mostrar uso das unidades no painel de navegação", zh: "在导航窗格显示磁盘容量").into(),
-        checked: crate::SHOW_CAP.load(Relaxed),
-        ..Default::default()
-    }];
-    if dropdown(h, at, items) == 1 {
-        crate::SHOW_CAP.fetch_xor(true, Relaxed);
-        crate::save_globals();
-        nav_dirty(); // the rows change height; nav_dirty clamps the scroll
-    }
-}
-
 unsafe fn tab_menu(h: HWND, i: usize, at: RECT) {
     let items = vec![
         mi(1, t!("Дублировать вкладку", "Duplicate tab", ja: "タブを複製", pt: "Duplicar guia", zh: "复制标签页")),
@@ -1378,7 +1366,7 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                         SORT => sort_menu(h, l.sort),
                         VIEW => view_menu(h, l.view),
                         MORE => more_menu(h, l.more),
-                        SETTINGS => settings_menu(h, l.gear),
+                        SETTINGS => crate::settings::show(GetParent(h)),
                         _ => {}
                     }
                 }
@@ -1458,8 +1446,6 @@ thread_local! {
     static NAV_DRAG: Cell<Option<(i32, i32)>> = const { Cell::new(None) }; // (start x, start width)
     static NAV_SB: Cell<Option<(i32, i32)>> = const { Cell::new(None) }; // (start y, start scroll) of a scrollbar drag
 }
-
-fn nav_width_file() -> Option<PathBuf> { env::var_os("APPDATA").map(|a| PathBuf::from(a).join("rust-explorer").join("nav-width.txt")) }
 
 pub fn nav_width() -> i32 { NAV_WIDTH.get() }
 
@@ -1616,9 +1602,7 @@ pub fn quick_folders() -> Vec<(String, PathBuf, &'static str)> {
 
 pub fn nav_init(h: HWND) {
     NAVWND.set(h as isize);
-    if let Some(f) = nav_width_file() {
-        if let Ok(s) = fs::read_to_string(f) { if let Ok(w) = s.trim().parse::<i32>() { NAV_WIDTH.set(w.clamp(180, 520)); } }
-    }
+    if let Some(w) = crate::cfg::number("ui", "navw") { NAV_WIDTH.set(w.clamp(180, 520)); }
     let section = |lbl: &str| NavItem { title: lbl.into(), path: PathBuf::new(), glyph: "", cap: None, depth: 0, kind: NavKind::Section, expandable: false, expanded: false };
     let node = |title: String, path: PathBuf, glyph: &'static str, kind: NavKind, expandable: bool| NavItem { title, path, glyph, cap: None, depth: 1, kind, expandable, expanded: false };
     let mut v = vec![section(t!("Быстрый доступ", "Quick access", ja: "クイック アクセス", pt: "Acesso rápido", zh: "快速访问"))];
@@ -1982,10 +1966,7 @@ pub unsafe extern "system" fn nav_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
             }
             if NAV_DRAG.take().is_some() {
                 ReleaseCapture();
-                if let Some(f) = nav_width_file() {
-                    if let Some(d) = f.parent() { let _ = fs::create_dir_all(d); }
-                    let _ = fs::write(f, nav_width().to_string());
-                }
+                crate::cfg::set("ui", "navw", &nav_width().to_string());
             }
         }
         _ => return DefWindowProcW(h, m, wp, lp),

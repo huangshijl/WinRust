@@ -27,6 +27,9 @@ mod shellwin; // registers the window as a shell window: "Show in folder" from o
 mod ctxmenu; // the Win11-style multi-column context menu (shell items laid out to the right of the click)
 mod fileops; // copy / move / delete: queue, progress window, conflicts, undo
 mod ui; // the look: palette, painted tabs / toolbar / address pill / status line, dark theme
+mod cfg; // settings.ini: the window place, the show switches, per-folder views, folded sections
+mod hotkey; // Win+E: a resident copy of this exe hooks the key and starts the real one
+mod settings; // the gear's popup: preferences with their own window
 
 static DESKTOP: AtomicBool = AtomicBool::new(false);
 fn desk() -> bool { DESKTOP.load(Relaxed) }
@@ -48,11 +51,6 @@ fn reload_wall() {
     let old = WALL.replace((wall::load(vx, vy, cw, ch), cw, ch)).0;
     if old != 0 { unsafe { windows_sys::Win32::Graphics::Gdi::DeleteObject(old as _) }; }
 }
-/// Where the file manager window was when it last closed: %APPDATA%\rust-explorer\window.txt, `max|normal left top right bottom`
-/// (the restored rectangle, so un-maximizing goes back to the size it had).
-fn place_file() -> PathBuf {
-    PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\window.txt")
-}
 fn parse_place(s: &str) -> Option<(bool, RECT)> {
     let mut it = s.split_whitespace();
     let max = match it.next()? { "max" => true, "normal" => false, _ => return None };
@@ -65,41 +63,38 @@ fn save_place(h: HWND) {
     wp.length = size_of::<WINDOWPLACEMENT>() as u32;
     if unsafe { GetWindowPlacement(h, &mut wp) } == 0 { return; }
     let r = wp.rcNormalPosition;
-    let f = place_file();
-    let _ = fs::create_dir_all(f.parent().unwrap_or(&f));
-    let _ = fs::write(f, format!("{} {} {} {} {}", if wp.showCmd == SW_SHOWMAXIMIZED as u32 { "max" } else { "normal" }, r.left, r.top, r.right, r.bottom));
+    cfg::set("window", "place", &format!("{} {} {} {} {}", if wp.showCmd == SW_SHOWMAXIMIZED as u32 { "max" } else { "normal" }, r.left, r.top, r.right, r.bottom));
 }
 /// The saved place, if it is still on a monitor (one may have been unplugged since).
 fn saved_place() -> Option<(bool, RECT)> {
     use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
-    let (max, r) = parse_place(&fs::read_to_string(place_file()).ok()?)?;
+    let (max, r) = parse_place(&cfg::get("window", "place")?)?;
     (!unsafe { MonitorFromRect(&r, MONITOR_DEFAULTTONULL) }.is_null()).then_some((max, r))
 }
 
 // ---------- per-folder view memory (view, sort, grouping, column widths) and global show switches ----------
 
-fn views_file() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\views.txt") }
-fn read_views() -> Vec<String> { fs::read_to_string(views_file()).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(str::to_string).collect() }
-fn write_views(lines: &[String]) {
-    let f = views_file();
-    let _ = fs::create_dir_all(f.parent().unwrap_or(&f));
-    let _ = fs::write(f, lines.join("\n"));
-}
 fn pref_key(dir: &PathBuf) -> String { dir.to_string_lossy().to_lowercase() }
+
+/// The folded sections of a tile page, one flag per heading (the number of headings can change between runs).
+fn saved_folds(dir: &Path) -> Vec<bool> { cfg::get("fold", &dir.to_string_lossy().to_lowercase()).map(|s| s.chars().map(|c| c == '1').collect()).unwrap_or_default() }
+fn save_folds() {
+    let (dir, flags) = ST.with_borrow(|st| (st.dir.clone(), st.tile_collapsed.clone()));
+    if flags.is_empty() { return; }
+    let s: String = flags.iter().map(|b| if *b { '1' } else { '0' }).collect();
+    cfg::set("fold", &pref_key(&dir), &s);
+}
 
 /// (view, sort column, ascending, group mode, the four column widths) saved for `dir`.
 fn read_view_pref(dir: &PathBuf) -> Option<(ViewMode, usize, bool, usize, [i32; 4])> {
-    let key = pref_key(dir);
-    for l in read_views() {
-        let mut it = l.split('\t');
-        if it.next()? != key { continue; }
-        let view = ViewMode::from_code(it.next()?.parse().ok()?)?;
-        let sort = it.next()?.parse().ok()?;
-        let asc = it.next()? == "1";
-        let group = it.next()?.parse().ok()?;
-        let w: Vec<i32> = it.filter_map(|x| x.parse().ok()).collect();
-        if w.len() == 4 { return Some((view, sort, asc, group, [w[0], w[1], w[2], w[3]])); }
-    }
+    let l = cfg::get("view", &pref_key(dir))?;
+    let mut it = l.split('\t');
+    let view = ViewMode::from_code(it.next()?.parse().ok()?)?;
+    let sort = it.next()?.parse().ok()?;
+    let asc = it.next()? == "1";
+    let group = it.next()?.parse().ok()?;
+    let w: Vec<i32> = it.filter_map(|x| x.parse().ok()).collect();
+    if w.len() == 4 { return Some((view, sort, asc, group, [w[0], w[1], w[2], w[3]])); }
     None
 }
 
@@ -116,30 +111,35 @@ pub(crate) fn save_current_view() {
     } else {
         read_view_pref(&dir).map(|p| p.4).filter(|w| w.iter().all(|&x| x > 0)).unwrap_or(defaults)
     };
-    let key = pref_key(&dir);
-    let line = format!("{key}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", view.code(), SORT_COL.load(Relaxed), u8::from(SORT_ASC.load(Relaxed)), GROUP.load(Relaxed), widths[0], widths[1], widths[2], widths[3]);
-    let mut lines: Vec<String> = read_views().into_iter().filter(|l| !l.starts_with("*\t") && l.split('\t').next() != Some(key.as_str())).collect();
-    lines.push(line);
-    write_views(&lines);
+    let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", view.code(), SORT_COL.load(Relaxed), u8::from(SORT_ASC.load(Relaxed)), GROUP.load(Relaxed), widths[0], widths[1], widths[2], widths[3]);
+    cfg::set("view", &pref_key(&dir), &line);
 }
 
-fn read_globals() -> Option<(bool, bool, bool, bool)> {
-    for l in read_views() {
-        let mut it = l.split('\t');
-        if it.next()? != "*" { continue; }
-        let compact = it.next()? == "1";
-        let ext = it.next()? == "1";
-        let nav = it.next().map_or(true, |v| v == "1"); // older files have fewer columns
-        let cap = it.next().map_or(true, |v| v == "1");
-        return Some((compact, ext, nav, cap));
-    }
-    None
+/// (compact, extensions, navigation pane, drive usage, check boxes, hidden items)
+fn read_globals() -> (bool, bool, bool, bool, bool, bool) {
+    (
+        cfg::boolean("ui", "compact").unwrap_or(false),
+        cfg::boolean("ui", "ext").unwrap_or_else(|| !hide_extensions()),
+        cfg::boolean("ui", "nav").unwrap_or(true),
+        cfg::boolean("ui", "cap").unwrap_or(true),
+        cfg::boolean("ui", "checks").unwrap_or(false),
+        cfg::boolean("ui", "hidden").unwrap_or(false),
+    )
 }
 
 pub(crate) fn save_globals() {
-    let mut lines: Vec<String> = read_views().into_iter().filter(|l| !l.starts_with("*\t")).collect();
-    lines.push(format!("*\t{}\t{}\t{}\t{}", u8::from(COMPACT.load(Relaxed)), u8::from(SHOW_EXT.load(Relaxed)), u8::from(NAV_ON.load(Relaxed)), u8::from(SHOW_CAP.load(Relaxed))));
-    write_views(&lines);
+    let mut ini = cfg::load();
+    for (k, on) in [
+        ("compact", COMPACT.load(Relaxed)),
+        ("ext", SHOW_EXT.load(Relaxed)),
+        ("nav", NAV_ON.load(Relaxed)),
+        ("cap", SHOW_CAP.load(Relaxed)),
+        ("checks", CHECK_BOXES.load(Relaxed)),
+        ("hidden", SHOW_HIDDEN.load(Relaxed)),
+    ] {
+        ini.set("ui", k, if on { "1" } else { "0" });
+    }
+    ini.save();
 }
 /// What the bar reserves at the top and bottom of the screen: the work area topbar sets when there is no explorer.
 fn work_strips() -> (i32, i32) {
@@ -915,7 +915,7 @@ unsafe fn bg_menu(h: HWND) {
 /// Command line -> (folder to open, file to select there). Understands `/select,"C:\a\b.txt"` (what browsers and other
 /// apps pass for "show in folder"), a plain folder, or a plain file path (its folder, file selected).
 fn start_target() -> (PathBuf, Option<String>) {
-    let mut a = env::args().skip(1);
+    let mut a = env::args().skip(1).filter(|a| a != "--focus");
     let mut p = a.next().unwrap_or_default();
     if p.to_lowercase().starts_with("/select,") || p.to_lowercase().starts_with("--select") {
         p = p.get(8..).unwrap_or("").trim_start_matches(',').to_string();
@@ -1308,7 +1308,8 @@ fn load(h: HWND, dir: PathBuf) {
             if n > nf { v.push((tf!("Устройства и диски ({})", "Devices and drives ({})", ja: "デバイスとドライブ ({})", pt: "Dispositivos e unidades ({})", zh: "设备和驱动器 ({})", n - nf), nf)); }
             v
         });
-        ST.with_borrow_mut(|st| { st.tile_starts = heads; st.tile_collapsed = vec![false; st.tile_starts.len()]; });
+        let folds = saved_folds(&dir);
+        ST.with_borrow_mut(|st| { st.tile_starts = heads; st.tile_collapsed = (0..st.tile_starts.len()).map(|i| folds.get(i).copied().unwrap_or(false)).collect(); });
     }
     let shown_dir = page_name(&dir).map_or_else(|| dir.to_string_lossy().into_owned(), str::to_string);
     unsafe { SetWindowTextW(edit, w(&shown_dir).as_ptr()) };
@@ -1543,6 +1544,7 @@ pub(crate) fn tile_toggle_at(list: HWND, x: i32, y: i32) -> bool {
     let k = ST.with_borrow(|st| st.tile_bands.iter().position(|(_, by, _)| y >= *by && y < by + head_h && x >= ui::sc(6)));
     let Some(k) = k else { return false };
     ST.with_borrow_mut(|st| { if let Some(c) = st.tile_collapsed.get_mut(k) { *c = !*c; } });
+    save_folds();
     tile_layout(list);
     unsafe { InvalidateRect(list, ptr::null(), 0) };
     true
@@ -1873,6 +1875,7 @@ fn select_all(h: HWND, invert: bool) {
 
 fn toggle_checkboxes() {
     CHECK_BOXES.fetch_xor(true, Relaxed);
+    save_globals();
     let list = ST.with_borrow(|st| st.list);
     unsafe { InvalidateRect(list, ptr::null(), 0) };
 }
@@ -3110,7 +3113,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     }
                     93 => toggle_checkboxes(),
                     94 => { SHOW_EXT.fetch_xor(true, Relaxed); save_globals(); reload(h); }
-                    95 => { SHOW_HIDDEN.fetch_xor(true, Relaxed); reload(h); }
+                    95 => { SHOW_HIDDEN.fetch_xor(true, Relaxed); save_globals(); reload(h); }
                     96 => {
                         COMPACT.fetch_xor(true, Relaxed);
                         save_globals();
@@ -3339,7 +3342,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             0x56 if ctrl => paste(h, &dir),
                             0x4E if ctrl && shift && !cur_virtual() => { create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true); return 0; }
                             0x4E if ctrl => { new_window(); return 0; } // Ctrl+N: a new window, like Explorer
-                            0x48 if ctrl => { SHOW_HIDDEN.fetch_xor(true, Relaxed); } // Ctrl+H: hidden files
+                            0x48 if ctrl => { SHOW_HIDDEN.fetch_xor(true, Relaxed); save_globals(); } // Ctrl+H: hidden files
                             0x74 => {} // F5: just the reload below
                             0x4D if ctrl => { toggle_view(h); return 0; } // Ctrl+M: details <-> thumbnails
                             0x54 if ctrl && shift => { tab_reopen(h); return 0; } // Ctrl+Shift+T: reopen the closed tab
@@ -3509,6 +3512,11 @@ fn namespace_target() -> Option<String> {
 }
 
 fn main() {
+    // the Win+E resident mode: no window, no COM, only the keyboard hook (see hotkey.rs)
+    if env::args().nth(1).as_deref() == Some("--hotkey") {
+        hotkey::run(env::args().nth(2).map(PathBuf::from).unwrap_or_else(|| env::current_exe().unwrap_or_default()));
+        return;
+    }
     if let Some(t) = namespace_target() {
         // control.exe opens its own window; explorer.exe given a namespace address opens it directly (no folder verb involved)
         // Only the "open" verb of folders is ours: control.exe and explorer.exe <address> both come back here through it
@@ -3531,11 +3539,13 @@ fn main() {
     // the old marker file meant "group by date"; the view menu now keeps the grouping itself
     let legacy = PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\group-by-date");
     if legacy.exists() { GROUP.store(1, Relaxed); let _ = fs::remove_file(&legacy); }
-    let (compact, ext, nav_on, show_cap) = read_globals().unwrap_or((false, !hide_extensions(), true, true));
+    let (compact, ext, nav_on, show_cap, checks, hidden) = read_globals();
     COMPACT.store(compact, Relaxed);
     SHOW_EXT.store(ext, Relaxed); // the saved switch, or the Windows "Hide extensions for known file types" setting
     NAV_ON.store(nav_on, Relaxed);
     SHOW_CAP.store(show_cap, Relaxed);
+    CHECK_BOXES.store(checks, Relaxed);
+    SHOW_HIDDEN.store(hidden, Relaxed);
     sh::init();
     unsafe {
         SetProcessDPIAware(); // sharp text at any scaling; every size below goes through ui::sc
@@ -3579,6 +3589,8 @@ fn main() {
                 }
                 None => { ShowWindow(win, SW_SHOWNORMAL); }
             }
+            // Win+E started this window from the background hook (which allowed it): take the foreground
+            if env::args().any(|a| a == "--focus") { SetForegroundWindow(win); }
         }
         let mut msg = std::mem::zeroed();
         while GetMessageW(&mut msg, 0 as _, 0, 0) > 0 {
