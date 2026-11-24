@@ -107,10 +107,12 @@ thread_local! {
     static MENU_H: Cell<isize> = const { Cell::new(0) };
 }
 
+/// Called from inside `STATE.with_borrow_mut` (a click, a key, a mnemonic), so it must not borrow STATE: the window handle
+/// lives in MENU_H.
 fn done(p: Pick) {
     DONE.with(|d| if d.get().is_none() { d.set(Some(p)); });
-    let h = STATE.with_borrow(|s| s.as_ref().map(|s| s.menu));
-    if let Some(h) = h { unsafe { PostMessageW(h, WM_NULL, 0, 0); } }
+    let h = MENU_H.with(|c| c.get());
+    if h != 0 { unsafe { PostMessageW(h as HWND, WM_NULL, 0, 0); } }
 }
 
 // ---------- model -> columns ----------
