@@ -123,20 +123,21 @@ pub(crate) fn save_current_view() {
     write_views(&lines);
 }
 
-fn read_globals() -> Option<(bool, bool)> {
+fn read_globals() -> Option<(bool, bool, bool)> {
     for l in read_views() {
         let mut it = l.split('\t');
         if it.next()? != "*" { continue; }
         let compact = it.next()? == "1";
         let ext = it.next()? == "1";
-        return Some((compact, ext));
+        let nav = it.next().map_or(true, |v| v == "1"); // older files have no third column
+        return Some((compact, ext, nav));
     }
     None
 }
 
 fn save_globals() {
     let mut lines: Vec<String> = read_views().into_iter().filter(|l| !l.starts_with("*\t")).collect();
-    lines.push(format!("*\t{}\t{}", u8::from(COMPACT.load(Relaxed)), u8::from(SHOW_EXT.load(Relaxed))));
+    lines.push(format!("*\t{}\t{}\t{}", u8::from(COMPACT.load(Relaxed)), u8::from(SHOW_EXT.load(Relaxed)), u8::from(NAV_ON.load(Relaxed))));
     write_views(&lines);
 }
 /// What the bar reserves at the top and bottom of the screen: the work area topbar sets when there is no explorer.
@@ -204,6 +205,7 @@ static SORT_ASC: AtomicBool = AtomicBool::new(true);
 static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false); // Ctrl+H
 static SHOW_EXT: AtomicBool = AtomicBool::new(true); // View > File name extensions
 static COMPACT: AtomicBool = AtomicBool::new(false); // View > Compact view
+pub static NAV_ON: AtomicBool = AtomicBool::new(true); // View > Show > Navigation pane
 static NAV: AtomicBool = AtomicBool::new(false); // loading from the back / forward trail: do not record it again
 const WM_NAV: u32 = WM_APP + 3; // wp: 1 back, 2 forward, 3 properties, 4 up (sent from the message loop for Alt+key)
 const WM_JOB: u32 = WM_APP + 5; // jobs.rs worker finished: wp = Box<Option<String>> (the error, if any)
@@ -737,6 +739,7 @@ unsafe fn bg_menu(h: HWND) {
             SendMessageW(list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) as isize & LVS_EX_CHECKBOXES as isize != 0
         };
         let show = vec![
+            check(90, t!("Область переходов", "Navigation pane", ja: "ナビゲーション ウィンドウ", pt: "Painel de navegação", zh: "导航窗格"), NAV_ON.load(Relaxed)),
             check(93, t!("Флажки элементов", "Item check boxes", ja: "項目のチェック ボックス", pt: "Caixas de seleção de itens", zh: "项目复选框"), checks),
             check(94, t!("Расширения имён файлов", "File name extensions", ja: "ファイル名拡張子", pt: "Extensões de nome de arquivo", zh: "文件扩展名"), SHOW_EXT.load(Relaxed)),
             check(95, t!("Скрытые элементы", "Hidden items", ja: "隠しファイル", pt: "Itens ocultos", zh: "隐藏的项目"), SHOW_HIDDEN.load(Relaxed)),
@@ -2825,6 +2828,14 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     70..=74 => group_now(h, [0, 2, 1, 3, 4][(wp - 70) as usize]),
                     80..=86 => { if let Some(v) = ViewMode::from_action(wp) { set_view(h, v); } }
                     87 => zoom_view(h, lp > 0),
+                    90 => { // View > Show > Navigation pane
+                        NAV_ON.fetch_xor(true, Relaxed);
+                        save_globals();
+                        let mut r: RECT = std::mem::zeroed();
+                        GetClientRect(h, &mut r);
+                        ui::layout_children(r.right, r.bottom);
+                        InvalidateRect(h, ptr::null(), 0);
+                    }
                     93 => toggle_checkboxes(),
                     94 => { SHOW_EXT.fetch_xor(true, Relaxed); save_globals(); reload(h); }
                     95 => { SHOW_HIDDEN.fetch_xor(true, Relaxed); reload(h); }
@@ -3218,9 +3229,10 @@ fn main() {
     // the old marker file meant "group by date"; the view menu now keeps the grouping itself
     let legacy = PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\group-by-date");
     if legacy.exists() { GROUP.store(1, Relaxed); let _ = fs::remove_file(&legacy); }
-    let (compact, ext) = read_globals().unwrap_or((false, !hide_extensions()));
+    let (compact, ext, nav_on) = read_globals().unwrap_or((false, !hide_extensions(), true));
     COMPACT.store(compact, Relaxed);
     SHOW_EXT.store(ext, Relaxed); // the saved switch, or the Windows "Hide extensions for known file types" setting
+    NAV_ON.store(nav_on, Relaxed);
     sh::init();
     unsafe {
         SetProcessDPIAware(); // sharp text at any scaling; every size below goes through ui::sc

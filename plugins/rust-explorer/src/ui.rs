@@ -75,6 +75,7 @@ const VIEW: i32 = 31;
 const MORE: i32 = 33;
 const SEARCH_BOX: i32 = 34;
 const SEARCH_CLEAR: i32 = 35;
+const NAV_BTN: i32 = 36; // shows / hides the navigation pane, left of "New"
 const WMIN: i32 = 41; // window buttons, in the tab row (which is the title bar: the window has no caption)
 const WMAX: i32 = 42;
 const WCLOSE: i32 = 43;
@@ -478,7 +479,7 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
 
 // ---------- layout and hit testing ----------
 
-struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, back: RECT, fwd: RECT, up: RECT, reload: RECT, pill: RECT, search: RECT, search_clear: RECT, new: RECT, new_more: RECT, cut: RECT, copy: RECT, paste: RECT, paste_more: RECT, rename: RECT, delete: RECT, share: RECT, sort: RECT, view: RECT, more: RECT, wmin: RECT, wmax: RECT, wclose: RECT, labels: bool, seps: Vec<i32> }
+struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, back: RECT, fwd: RECT, up: RECT, reload: RECT, pill: RECT, search: RECT, search_clear: RECT, navbtn: RECT, new: RECT, new_more: RECT, cut: RECT, copy: RECT, paste: RECT, paste_more: RECT, rename: RECT, delete: RECT, share: RECT, sort: RECT, view: RECT, more: RECT, wmin: RECT, wmax: RECT, wclose: RECT, labels: bool, seps: Vec<i32> }
 
 fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT { RECT { left: l, top: t, right: r, bottom: b } }
 
@@ -540,12 +541,16 @@ fn layout(cw: i32, n: usize) -> Layout {
     ];
     let item = |label: &str| if labels { sc(10) + sc(16) + sc(7) + label_w(label) + sc(10) } else { sc(40) };
     let mut x = pad;
+    // the navigation pane on / off, left of "New"
+    let navbtn = btn(x, sc(36));
+    x += sc(36) + sc(6);
+    let mut seps = vec![];
+    seps.push(x); x += sc(5);
     let new_main = if labels { sc(10) + sc(16) + sc(7) + label_w(l_new) + sc(6) } else { sc(34) };
     let new_chev = sc(20);
     let new = btn(x, new_main);
     let new_more = rc(x + new_main, cy0, x + new_main + new_chev, cy1);
     x += new_main + new_chev;
-    let mut seps = vec![];
     x += sc(4); seps.push(x); x += sc(5);
     let cut = btn(x, item(l_cut)); x += cut.right - cut.left + sc(2);
     let copy = btn(x, item(l_copy)); x += copy.right - copy.left + sc(2);
@@ -564,7 +569,7 @@ fn layout(cw: i32, n: usize) -> Layout {
     let sort = rc(view.left - sc(2) - sort_w, cy0, view.left - sc(2), cy1);
     let _ = x;
 
-    Layout { tabs, close, plus, back: nav(0), fwd: nav(1), up: nav(2), reload, pill, search, search_clear, new, new_more, cut, copy, paste, paste_more, rename, delete, share, sort, view, more, wmin, wmax, wclose, labels, seps }
+    Layout { tabs, close, plus, back: nav(0), fwd: nav(1), up: nav(2), reload, pill, search, search_clear, navbtn, new, new_more, cut, copy, paste, paste_more, rename, delete, share, sort, view, more, wmin, wmax, wclose, labels, seps }
 }
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool { x >= r.left && x < r.right && y >= r.top && y < r.bottom }
@@ -575,7 +580,7 @@ fn hit(l: &Layout, x: i32, y: i32) -> i32 {
     }
     for (i, c) in l.close.iter().enumerate() { if inside(c, x, y) { return CLOSE + i as i32; } }
     for (i, t) in l.tabs.iter().enumerate() { if inside(t, x, y) { return TAB + i as i32; } }
-    for (k, r) in [(BACK, &l.back), (FWD, &l.fwd), (UP, &l.up), (RELOAD, &l.reload), (PLUS, &l.plus)] {
+    for (k, r) in [(BACK, &l.back), (FWD, &l.fwd), (UP, &l.up), (RELOAD, &l.reload), (PLUS, &l.plus), (NAV_BTN, &l.navbtn)] {
         if inside(r, x, y) { return k; }
     }
     if inside(&l.new_more, x, y) { return NEW_MORE; }
@@ -830,6 +835,10 @@ unsafe fn paint_chrome(hwnd: HWND) {
             text(dc, label, rc(r.left + sc(32), r.top, r.right - sc(6), r.bottom), if enabled { pal().text } else { off }, DT_LEFT);
         }
     }
+    // the navigation pane toggle, left of "New": lit while the pane is shown
+    glow(dc, NAV_BTN, l.navbtn, pal().bg, pal().hover, sc(4), hot == NAV_BTN);
+    SelectObject(dc, f_glyph);
+    text(dc, "\u{E700}", l.navbtn, if NAV_ON.load(Relaxed) { pal().text } else { off() }, DT_CENTER);
     cmd(dc, NEW, l.new, "\u{E710}", c_new, new_on, hot, l.labels, f_glyph, f_cmd, off());
     glow(dc, NEW_MORE, l.new_more, pal().bg, pal().hover, sc(4), hot == NEW_MORE);
     SelectObject(dc, f_small);
@@ -984,6 +993,7 @@ unsafe fn view_menu(h: HWND, at: RECT) {
         ctxmenu::Item::separator(),
     ];
     let show = vec![
+        mcheck(90, t!("Область переходов", "Navigation pane", ja: "ナビゲーション ウィンドウ", pt: "Painel de navegação", zh: "导航窗格"), NAV_ON.load(Relaxed)),
         mcheck(93, t!("Флажки элементов", "Item check boxes", ja: "項目のチェック ボックス", pt: "Caixas de seleção de itens", zh: "项目复选框"), checks),
         mcheck(94, t!("Расширения имён файлов", "File name extensions", ja: "ファイル名拡張子", pt: "Extensões de nome de arquivo", zh: "文件扩展名"), ext),
         mcheck(95, t!("Скрытые элементы", "Hidden items", ja: "隠しファイル", pt: "Itens ocultos", zh: "隐藏的项目"), SHOW_HIDDEN.load(Relaxed)),
@@ -1176,7 +1186,7 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             InvalidateRect(h, ptr::null(), 0);
             let (act, idx) = match k {
                 CUT => (10, 0), COPY => (11, 0), PASTE => (12, 0), RENAME => (13, 0), DELETE => (14, 0), SHARE => (50, 0),
-                BACK => (4, 0), FWD => (5, 0), UP => (6, 0), RELOAD => (7, 0), PLUS => (3, 0),
+                BACK => (4, 0), FWD => (5, 0), UP => (6, 0), RELOAD => (7, 0), PLUS => (3, 0), NAV_BTN => (90, 0),
                 k if k >= CLOSE => (2, (k - CLOSE) as isize),
                 k => (if m == WM_MBUTTONDOWN { 2 } else { 1 }, (k - TAB) as isize), // middle click on a tab closes it
             };
@@ -1277,6 +1287,7 @@ thread_local! {
     static NAV_SCROLL: Cell<i32> = const { Cell::new(0) };
     static NAV_WIDTH: Cell<i32> = const { Cell::new(NAV_W_DEFAULT) };
     static NAV_DRAG: Cell<Option<(i32, i32)>> = const { Cell::new(None) }; // (start x, start width)
+    static NAV_SB: Cell<Option<(i32, i32)>> = const { Cell::new(None) }; // (start y, start scroll) of a scrollbar drag
 }
 
 fn nav_width_file() -> Option<PathBuf> { env::var_os("APPDATA").map(|a| PathBuf::from(a).join("rust-explorer").join("nav-width.txt")) }
@@ -1458,31 +1469,10 @@ fn nav_ensure_current() {
     });
 }
 
-/// Opens the tree down to `dir` so the current folder is visible in the pane.
+/// Highlights the row that contains `dir`. The tree stays collapsed unless the user opens it — a folder deep down simply
+/// has no row of its own, as in Explorer.
 pub fn nav_sync(dir: &Path) {
     if dir.as_os_str().is_empty() || dir.to_string_lossy().starts_with("::") { return; }
-    let d = dir.to_string_lossy().to_lowercase();
-    NAV.with_borrow_mut(|v| {
-        let mut best: Option<usize> = None;
-        let mut best_len = 0;
-        for (i, it) in v.iter().enumerate() {
-            if it.kind == NavKind::Section { continue; }
-            let p = it.path.to_string_lossy().to_lowercase();
-            if !p.is_empty() && d.starts_with(&p) && p.len() > best_len { best = Some(i); best_len = p.len(); }
-        }
-        let Some(mut idx) = best else { return };
-        for _ in 0..8 {
-            if !v[idx].expanded { expand_vec(v, idx); }
-            let base = v[idx].path.clone();
-            let base_s = base.to_string_lossy();
-            let d_s = dir.to_string_lossy();
-            let rest = if d_s.len() > base_s.len() { d_s[base_s.len()..].trim_start_matches(['\\', '/']) } else { "" };
-            let Some(comp) = rest.split(['\\', '/']).find(|s| !s.is_empty()) else { break };
-            let want = base.join(comp).to_string_lossy().to_lowercase();
-            let Some(child) = (idx + 1..v.len()).take_while(|&j| v[j].depth > v[idx].depth).find(|&j| v[j].path.to_string_lossy().to_lowercase() == want) else { break };
-            idx = child;
-        }
-    });
     nav_ensure_current();
     nav_dirty();
 }
@@ -1509,7 +1499,31 @@ pub fn nav_path(i: usize) -> Option<PathBuf> {
 
 pub fn nav_dirty() {
     let h = NAVWND.get() as HWND;
-    if !h.is_null() { unsafe { InvalidateRect(h, ptr::null(), 0) }; }
+    if h.is_null() { return; }
+    // the tree changed: keep the scroll inside the content
+    let vp = nav_viewport();
+    if vp > 0 { NAV_SCROLL.set(NAV_SCROLL.get().clamp(0, (nav_total() - vp).max(0))); }
+    unsafe { InvalidateRect(h, ptr::null(), 0) };
+}
+
+/// Height of the whole tree plus the pane's top and bottom margins.
+fn nav_total() -> i32 { NAV.with_borrow(|n| n.iter().map(nav_h).sum::<i32>()) + sc(8) * 2 }
+
+fn nav_viewport() -> i32 {
+    let h = NAVWND.get() as HWND;
+    if h.is_null() { return 0; }
+    let mut cr: RECT = unsafe { std::mem::zeroed() };
+    unsafe { GetClientRect(h, &mut cr) };
+    cr.bottom
+}
+
+/// The scrollbar thumb (top, height) when the tree is taller than the pane.
+fn nav_thumb(vp: i32, total: i32) -> Option<(i32, i32)> {
+    if vp <= 0 || total <= vp + sc(2) { return None; }
+    let th = ((vp * vp) / total).max(sc(28)).min(vp - sc(8));
+    let span = (vp - th - sc(8)).max(1);
+    let maxs = (total - vp).max(1);
+    Some((sc(4) + NAV_SCROLL.get() * span / maxs, th))
 }
 
 /// Chrome on top, the pane on the left (hidden when the window is narrow), the list takes the rest.
@@ -1517,10 +1531,12 @@ pub unsafe fn layout_children(cw: i32, ch: i32) {
     let (chrome, list) = ST.with(|c| c.try_borrow().map_or((ptr::null_mut(), ptr::null_mut()), |s| (s.tab, s.list)));
     let nav = NAVWND.get() as HWND;
     let (top, status) = (sc(CHROME_H), sc(STATUS_H));
-    let nw = if cw > sc(760) { sc(nav_width()) } else { 0 };
+    let on = NAV_ON.load(Relaxed) && cw > sc(760);
+    let nw = if on { sc(nav_width()) } else { 0 };
     let h = (ch - top - status).max(0);
     MoveWindow(chrome, 0, 0, cw, top, 1);
     MoveWindow(nav, 0, top, nw, h, 1);
+    ShowWindow(nav, if on { SW_SHOWNA } else { SW_HIDE });
     MoveWindow(list, nw, top, cw - nw, h, 1);
     fit_filler(list);
     nav_ensure_current();
@@ -1619,6 +1635,9 @@ unsafe fn paint_nav(hwnd: HWND) {
             y += hgt;
         }
     });
+    if let Some((ty, th)) = nav_thumb(cr.bottom, nav_total()) {
+        fill(dc, rc(cr.right - sc(10), ty, cr.right - sc(5), ty + th), mix(pal().bg, pal().dim, 0.45), sc(3));
+    }
     fill(dc, rc(cr.right - 1, 0, cr.right, cr.bottom), pal().line, 0); // hairline between the pane and the list
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, of);
@@ -1650,6 +1669,20 @@ pub unsafe extern "system" fn nav_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
             return DefWindowProcW(h, m, wp, lp);
         }
         WM_MOUSEMOVE => {
+            if let Some((y0, s0)) = NAV_SB.get() {
+                if GetKeyState(0x01) < 0 { // VK_LBUTTON
+                    let mut cr: RECT = std::mem::zeroed();
+                    GetClientRect(h, &mut cr);
+                    let total = nav_total();
+                    let vp = cr.bottom;
+                    let th = nav_thumb(vp, total).map_or(sc(28), |t| t.1);
+                    let span = (vp - th - sc(8)).max(1);
+                    let maxs = (total - vp).max(1);
+                    NAV_SCROLL.set((s0 + (y - y0) * maxs / span).clamp(0, maxs));
+                    InvalidateRect(h, ptr::null(), 0);
+                    return 0;
+                }
+            }
             if let Some((sx, sw)) = NAV_DRAG.get() {
                 if GetKeyState(0x01) < 0 { // VK_LBUTTON
                     let w = (sw + x - sx).clamp(180, 520);
@@ -1710,6 +1743,19 @@ pub unsafe extern "system" fn nav_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONDOWN => {
             let mut cr: RECT = std::mem::zeroed();
             GetClientRect(h, &mut cr);
+            // the overlay scrollbar, just left of the splitter
+            if x >= cr.right - sc(11) && x < cr.right - sc(4) {
+                if let Some((_ty, th)) = nav_thumb(cr.bottom, nav_total()) {
+                    let span = (cr.bottom - th - sc(8)).max(1);
+                    let maxs = (nav_total() - cr.bottom).max(1);
+                    let y0 = (y - th / 2).clamp(sc(4), sc(4) + span);
+                    NAV_SCROLL.set(((y0 - sc(4)) * maxs / span).clamp(0, maxs));
+                    NAV_SB.set(Some((y, NAV_SCROLL.get())));
+                    SetCapture(h);
+                    InvalidateRect(h, ptr::null(), 0);
+                    return 0;
+                }
+            }
             if x >= cr.right - sc(5) {
                 NAV_DRAG.set(Some((x, nav_width())));
                 SetCapture(h);
@@ -1728,6 +1774,11 @@ pub unsafe extern "system" fn nav_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_LBUTTONUP => {
+            if NAV_SB.take().is_some() {
+                ReleaseCapture();
+                InvalidateRect(h, ptr::null(), 0);
+                return 0;
+            }
             if NAV_DRAG.take().is_some() {
                 ReleaseCapture();
                 if let Some(f) = nav_width_file() {

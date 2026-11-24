@@ -174,6 +174,8 @@ impl State {
         self.rebuild();
         let changed = prev.as_ref().map_or(true, |(b, p, s)| *b != self.base || *p != self.path || *s != self.show);
         if changed { self.layout(); }
+        // the hover moves even when no column opens or closes: repaint so the highlight actually follows the pointer
+        if !self.menu.is_null() { unsafe { InvalidateRect(self.menu, ptr::null(), 0) }; }
     }
 
     fn root_hover(&mut self, col: usize, row: usize) {
