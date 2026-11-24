@@ -292,7 +292,25 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
     match cd.nmcd.dwDrawStage {
         CDDS_PREPAINT => (CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT) as isize,
         CDDS_POSTPAINT => {
-            if SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 0 {
+            // the Explorer theme paints column separators into the empty area below the rows; cover it with the list colour
+            let n = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0);
+            let mut bottom = 0;
+            if n > 0 {
+                let mut r = RECT { left: LVIR_BOUNDS as i32, ..std::mem::zeroed() };
+                if SendMessageW(list, LVM_GETITEMRECT, n as usize - 1, &mut r as *mut _ as isize) != 0 { bottom = r.bottom; }
+            }
+            let (mut right, mut bot) = (cr.right, cr.bottom);
+            let mut vr: RECT = std::mem::zeroed();
+            if SendMessageW(list, LVM_GETVIEWRECT, 0, &mut vr as *mut _ as isize) != 0 {
+                if vr.bottom > cr.bottom { right -= GetSystemMetrics(SM_CXVSCROLL); } // the bars stay
+                if vr.right > cr.right { bot -= GetSystemMetrics(SM_CYHSCROLL); }
+            }
+            if bottom < bot {
+                let b = CreateSolidBrush(listbg());
+                FillRect(dc, &rc(0, bottom, right, bot), b);
+                DeleteObject(b as HGDIOBJ);
+            }
+            if n == 0 {
                 // an empty folder says so instead of showing a blank list
                 let (f_big, f_txt) = (font(40, 400, winrust_common::style::icon_face()) as HFONT, font(14, 400, ui_face()) as HFONT);
                 SetBkMode(dc, TRANSPARENT as i32);
