@@ -19,7 +19,7 @@
 #![windows_subsystem = "windows"]
 use std::{cell::RefCell, env, fs, os::windows::fs::MetadataExt, path::{Path, PathBuf}, ptr, sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed}};
 use winrust_common::{t, tf};
-use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{GetStockObject, InvalidateRect}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL}, Shell::*, WindowsAndMessaging::*}};
+use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{GetStockObject, InvalidateRect}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT}, Shell::*, WindowsAndMessaging::*}};
 
 mod zipx; // our own ZIP engine (deflate, inflate, container)
 mod jobs; // our own copier, ZIP packer, ZIP/7z unpacker (background, progress in the status line)
@@ -93,7 +93,9 @@ const WM_THUMB: u32 = WM_APP + 2; // worker -> UI: wp = Box<(era, row, HBITMAP)>
 static GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // bumped on every new listing; stale thumbnails are dropped
 static TX: std::sync::OnceLock<std::sync::mpsc::Sender<(u32, usize, PathBuf)>> = std::sync::OnceLock::new();
 const WM_GO: u32 = WM_APP + 1; // address bar: Enter (wp 13) / Esc (wp 27)
+const WM_SEARCH: u32 = WM_APP + 7; // search box: Enter (wp 13) / Esc (wp 27)
 static EDIT_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static SEARCH_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static LABEL_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0); // the rename box (only one exists at a time)
 
 struct Row { name: String, dir: bool, size: u64, time: u64, icon: i32, thumb: i32, hdr: bool } // time: FILETIME ticks; thumb: -2 not asked, -1 asked, >=0 image-list index
@@ -112,9 +114,9 @@ impl Hist {
     fn forward(&mut self) -> Option<PathBuf> { if self.pos + 1 < self.v.len() { self.pos += 1; Some(self.v[self.pos].clone()) } else { None } }
 }
 
-struct State { list: HWND, tab: HWND, edit: HWND, dir: PathBuf, rows: Vec<Row>, thumbs: bool, himl: isize, tabs: Vec<PathBuf>, active: usize, hist: Hist }
+struct State { list: HWND, tab: HWND, edit: HWND, search: HWND, dir: PathBuf, rows: Vec<Row>, thumbs: bool, himl: isize, tabs: Vec<PathBuf>, active: usize, hist: Hist, closed: Vec<PathBuf> }
 thread_local! {
-    static ST: RefCell<State> = RefCell::new(State { list: 0 as _, tab: 0 as _, edit: 0 as _, dir: PathBuf::new(), rows: vec![], thumbs: false, himl: 0, tabs: vec![], active: 0, hist: Hist { v: vec![], pos: 0 } });
+    static ST: RefCell<State> = RefCell::new(State { list: 0 as _, tab: 0 as _, edit: 0 as _, search: 0 as _, dir: PathBuf::new(), rows: vec![], thumbs: false, himl: 0, tabs: vec![], active: 0, hist: Hist { v: vec![], pos: 0 }, closed: vec![] });
 }
 static SORT_COL: AtomicUsize = AtomicUsize::new(0); // 0 name, 1 size, 2 modified
 static SORT_ASC: AtomicBool = AtomicBool::new(true);
@@ -537,6 +539,8 @@ fn start_target() -> (PathBuf, Option<String>) {
         if p.is_empty() { p = a.next().unwrap_or_default(); }
     }
     let p = PathBuf::from(p.trim_matches('"'));
+    // a path given with forward slashes (a command line or a URL-like string) is normalized: shell APIs want backslashes
+    let p = if p.to_string_lossy().contains('/') { PathBuf::from(p.to_string_lossy().replace('/', "\\")) } else { p };
     if p.as_os_str().is_empty() { return (PathBuf::from("C:\\"), None); }
     match (p.is_file(), p.parent()) {
         (true, Some(d)) => (d.to_path_buf(), p.file_name().map(|n| n.to_string_lossy().into_owned())),
@@ -621,6 +625,13 @@ fn label(dir: &PathBuf) -> String {
     dir.file_name().map_or_else(|| dir.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
 }
 
+/// "winrust - File Explorer", like the window title in Windows 11.
+fn window_title(dir: &PathBuf) -> String {
+    let name = if dir.file_name().is_some() { label(dir) } else { dir.to_string_lossy().trim_end_matches(['\\', '/']).to_string() };
+    let app = t!("Проводник", "File Explorer", ja: "エクスプローラー", pt: "Explorador de Arquivos", zh: "文件资源管理器");
+    format!("{name} - {app}")
+}
+
 /// Rows of `dir`, folders first. Desktop mode merges the public desktop (absolute names) and hides hidden files.
 /// None = `dir` itself is unreadable.
 fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
@@ -653,14 +664,15 @@ fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
 /// Never call with ST borrowed: the list sends GETDISPINFO back into the window proc.
 fn load(h: HWND, dir: PathBuf) {
     let Some(rows) = rows_of(&dir) else { return };
-    if !desk() { unsafe { SetWindowTextW(h, w(&dir.to_string_lossy()).as_ptr()) }; }
-    let (list, tab, edit, active, n) = ST.with_borrow_mut(|st| {
+    if !desk() { unsafe { SetWindowTextW(h, w(&window_title(&dir)).as_ptr()) }; }
+    let (list, tab, edit, search, active, n) = ST.with_borrow_mut(|st| {
         if let Some(t) = st.tabs.get_mut(st.active) { *t = dir.clone(); }
         st.dir = dir.clone(); st.rows = rows;
         if !NAV.load(Relaxed) { st.hist.visit(dir.clone()); }
-        (st.list, st.tab, st.edit, st.active, st.rows.len())
+        (st.list, st.tab, st.edit, st.search, st.active, st.rows.len())
     });
     unsafe { SetWindowTextW(edit, w(&dir.to_string_lossy()).as_ptr()) };
+    if search != 0 as HWND { unsafe { SetWindowTextW(search, w("").as_ptr()) }; }
     shellwin::navigated(&dir);
     ui::set_search(None); // a folder again: the pill shows its path
     tab_text(tab, active, &label(&dir), false);
@@ -688,37 +700,28 @@ fn ask(d: char, q: &str) -> Option<String> {
 /// Never call with ST borrowed.
 fn search(h: HWND, q: &str) {
     let mut rows = vec![];
-    let mut more = String::new();
     let mut indexed = false; // some drive had a rust-search service
     for d in 'A'..='Z' {
         let Some(reply) = ask(d, q) else { continue };
         indexed = true;
         for line in reply.lines() {
-            if line.starts_with("... ") { more = format!(", {}", line.trim_start_matches("... ")); continue; }
+            if line.starts_with("... ") { continue; }
             let m = fs::metadata(line).ok();
             rows.push(row(line.to_string(), m.as_ref()));
         }
     }
     if !indexed {
         // no rust-search installed: look through the current folder and below instead
-        let (local, cut, flipped) = local_search(&cur_dir(), q);
-        if flipped { more = tf!(" для «{}»", " for \u{201C}{}\u{201D}", ja: "「{}」として", pt: " para \u{201C}{}\u{201D}", zh: "（按「{}」）", flip_layout(q)); } // typed in the wrong layout: shown what was meant
-        rows = local;
-        if cut { more += t!(", остановлено: уточните запрос", ", stopped early: narrow the search", ja: "、中断: 検索範囲を狭めてください", pt: ", interrompido: refine a pesquisa", zh: "，已提前停止：请缩小搜索范围"); }
+        rows = local_search(&cur_dir(), q).0;
     }
     let n = rows.len();
-    let where_ = if indexed { "" } else { t!(" в этой папке", " in this folder", ja: "（このフォルダー内）", pt: " nesta pasta", zh: "（仅此文件夹）") };
-    let title = if n == 0 {
-        tf!("поиск: {} - ничего не найдено{}{}", "search: {} - nothing{}{}", ja: "検索: {} - 見つかりません{}{}", pt: "pesquisa: {} - nada encontrado{}{}", zh: "搜索：{} - 无结果{}{}", q, where_, "")
-    } else {
-        tf!("поиск: {} - совпадений: {}{}{}", "search: {} - {} hits{}{}", ja: "検索: {} - {} 件{}{}", pt: "pesquisa: {} - {} resultados{}{}", zh: "搜索：{} - {} 个结果{}{}", q, n, where_, more)
-    };
     ui::set_search(Some(q.to_string()));
-    unsafe { SetWindowTextW(h, w(&title).as_ptr()) };
+    if let Some(se) = ST.with_borrow(|st| (st.search != 0 as HWND).then_some(st.search)) { unsafe { SetWindowTextW(se, w(q).as_ptr()) }; }
     let list = ST.with_borrow_mut(|st| { st.rows = rows; st.list });
     reset_thumbs();
     put(list, LVM_DELETEALLITEMS, 0, 0);
     put(list, LVM_SETITEMCOUNT, n, 0);
+    unsafe { ui::status_dirty(h) };
 }
 
 /// The same keys typed in the other layout (QWERTY <-> ЙЦУКЕН): "сфкпщ" -> "cargo", "ljrevtyns" -> "документы".
@@ -789,6 +792,46 @@ fn tab_new() {
     tab_text(tab, 0, "", true);
 }
 
+/// Reopens the tab that was closed last (Ctrl+Shift+T), like Explorer.
+fn tab_reopen(h: HWND) {
+    let Some(dir) = ST.with_borrow_mut(|st| st.closed.pop()) else { return };
+    let (tab, active) = ST.with_borrow_mut(|st| { st.tabs.push(dir.clone()); st.active = st.tabs.len() - 1; (st.tab, st.active) });
+    tab_text(tab, active, "", true);
+    load(h, dir);
+}
+
+/// A second window on the current folder (Ctrl+N in Explorer opens a window, not a folder).
+fn new_window() {
+    let Ok(exe) = env::current_exe() else { return };
+    let _ = std::process::Command::new(exe).arg(cur_dir()).spawn();
+}
+
+/// Plain text on the system clipboard (Ctrl+Shift+C copies the selected paths).
+fn clip_text(s: &str) -> bool {
+    use windows_sys::Win32::System::{DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData}, Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE}, Ole::CF_UNICODETEXT};
+    unsafe {
+        if OpenClipboard(ptr::null_mut()) == 0 { return false; }
+        EmptyClipboard();
+        let u: Vec<u16> = s.encode_utf16().chain([0]).collect();
+        let h = GlobalAlloc(GMEM_MOVEABLE, u.len() * 2);
+        if h.is_null() { CloseClipboard(); return false; }
+        let p = GlobalLock(h) as *mut u16;
+        if p.is_null() { CloseClipboard(); return false; }
+        ptr::copy_nonoverlapping(u.as_ptr(), p, u.len());
+        GlobalUnlock(h);
+        let ok = !SetClipboardData(CF_UNICODETEXT as u32, h).is_null(); // the clipboard owns the memory from here
+        CloseClipboard();
+        ok
+    }
+}
+
+/// Copy path / Copy as path: the selection, or the folder itself when nothing is selected.
+fn copy_path(h: HWND) {
+    let (_, dir, paths) = selected();
+    let text = if paths.is_empty() { dir.to_string_lossy().into_owned() } else { paths.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join("\r\n") };
+    if !clip_text(&text) { warn(h, "Cannot open the clipboard"); }
+}
+
 fn tab_select(h: HWND, i: usize) {
     let dir = ST.with_borrow_mut(|st| { st.active = i; st.tabs[i].clone() });
     load(h, dir);
@@ -798,8 +841,11 @@ fn tab_close(h: HWND) { let a = ST.with_borrow(|st| st.active); tab_close_at(h, 
 
 /// Closes tab `i` (the last one stays). The listing changes only when the active tab was the one closed.
 fn tab_close_at(h: HWND, i: usize) {
+    if ST.with_borrow(|st| st.tabs.len() < 2) { unsafe { PostMessageW(h, WM_CLOSE, 0, 0) }; return; } // the last tab closes the window
     let (tab, was_active) = ST.with_borrow_mut(|st| {
-        if st.tabs.len() < 2 || i >= st.tabs.len() { return (st.tab, None); }
+        if i >= st.tabs.len() { return (st.tab, None); }
+        st.closed.push(st.tabs[i].clone());
+        if st.closed.len() > 20 { st.closed.remove(0); }
         st.tabs.remove(i);
         let before = st.active;
         st.active = if i < before { before - 1 } else { before.min(st.tabs.len() - 1) };
@@ -813,21 +859,121 @@ fn tab_close_at(h: HWND, i: usize) {
 }
 
 fn toggle_view(h: HWND) {
-    let (list, on) = ST.with_borrow_mut(|st| { st.thumbs = !st.thumbs; (st.list, st.thumbs) });
+    let on = ST.with_borrow(|st| st.thumbs);
+    set_view(h, !on);
+}
+
+/// Details (thumbs = false) or large thumbnails (thumbs = true), like Explorer's view menu.
+fn set_view(h: HWND, thumbs: bool) {
+    let (list, on) = ST.with_borrow_mut(|st| { st.thumbs = thumbs; (st.list, st.thumbs) });
     THUMBS.store(on, Relaxed);
     ui::row_height(list, !on);
     put(list, LVM_SETVIEW, if on { LV_VIEW_ICON } else { LV_VIEW_DETAILS } as usize, 0);
     reload(h);
 }
 
-/// Address box in search mode ("? terms").
-fn search_focus() {
-    let edit = ST.with_borrow(|st| st.edit);
-    unsafe {
-        SetWindowTextW(edit, w("? ").as_ptr());
-        SetFocus(edit);
+/// Sorts the rows that are on screen (a folder or the hits of a search) and repaints.
+fn sort_now(h: HWND, c: usize, asc: bool) {
+    SORT_COL.store(c, Relaxed);
+    SORT_ASC.store(asc, Relaxed);
+    let n = ST.with_borrow_mut(|st| {
+        st.rows.retain(|r| !r.hdr);
+        sort_rows(&mut st.rows, c, asc);
+        add_headers(&mut st.rows);
+        st.rows.iter_mut().for_each(|r| r.thumb = -2);
+        st.rows.len()
+    });
+    reset_thumbs();
+    let list = ST.with_borrow(|st| st.list);
+    put(list, LVM_REDRAWITEMS, 0, n as isize - 1);
+    let hdr = put(list, LVM_GETHEADER, 0, 0) as HWND;
+    if !hdr.is_null() { unsafe { InvalidateRect(hdr, ptr::null(), 0) }; }
+    unsafe { ui::status_dirty(h) };
+}
+
+/// "Group by date" on / off, then the rows are grouped again.
+fn group_now(h: HWND, on: bool) {
+    let k = group_marker();
+    if on {
+        if let Some(d) = k.parent() { let _ = fs::create_dir_all(d); }
+        let _ = fs::write(&k, "1");
+    } else {
+        let _ = fs::remove_file(&k);
     }
-    put(edit, EM_SETSEL, 2, 2);
+    sort_now(h, SORT_COL.load(Relaxed), SORT_ASC.load(Relaxed));
+}
+
+/// Select all, or invert the selection.
+fn select_all(h: HWND, invert: bool) {
+    let (list, n, rows) = ST.with_borrow(|st| (st.list, st.rows.len(), st.rows.iter().map(|r| r.hdr).collect::<Vec<_>>()));
+    let mut it: LVITEMW = unsafe { std::mem::zeroed() };
+    it.stateMask = LVIS_SELECTED;
+    if !invert {
+        it.state = LVIS_SELECTED;
+        put(list, LVM_SETITEMSTATE, usize::MAX, &it as *const _ as isize);
+    } else {
+        for i in 0..n {
+            if rows[i] { continue; }
+            let on = put(list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) as u32 & LVIS_SELECTED != 0;
+            it.state = if on { 0 } else { LVIS_SELECTED };
+            put(list, LVM_SETITEMSTATE, i, &it as *const _ as isize);
+        }
+    }
+    unsafe { ui::status_dirty(h) };
+}
+
+fn toggle_checkboxes() {
+    let list = ST.with_borrow(|st| st.list);
+    let ex = put(list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) as isize;
+    let bit = LVS_EX_CHECKBOXES as isize;
+    put(list, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_CHECKBOXES as usize, if ex & bit != 0 { ex & !bit } else { ex | bit });
+}
+
+fn duplicate_tab(h: HWND, i: usize) {
+    let Some(p) = ST.with_borrow(|st| st.tabs.get(i).cloned()) else { return };
+    let (tab, active) = ST.with_borrow_mut(|st| {
+        let at = (st.active + 1).min(st.tabs.len());
+        st.tabs.insert(at, p.clone());
+        st.active = at;
+        (st.tab, st.active)
+    });
+    tab_text(tab, active, "", true);
+    load(h, p);
+}
+
+fn close_other_tabs(h: HWND, i: usize) {
+    let Some(p) = ST.with_borrow(|st| st.tabs.get(i).cloned()) else { return };
+    ST.with_borrow_mut(|st| { st.tabs = vec![p.clone()]; st.active = 0; });
+    load(h, p);
+}
+
+fn copy_tab_path(h: HWND, i: usize) {
+    if let Some(p) = ST.with_borrow(|st| st.tabs.get(i).cloned()) { if !clip_text(&p.to_string_lossy()) { warn(h, "Cannot open the clipboard"); } }
+}
+
+/// "New > Compressed (zipped) folder": an empty, valid ZIP named like Explorer names it.
+fn new_zip(h: HWND, dir: &PathBuf) {
+    if zipx::split_zip(dir).is_some() { warn(h, &t!("Архив открыт только для чтения", "An archive is read-only", ja: "アーカイブは読み取り専用です", pt: "Um arquivo é somente leitura", zh: "压缩包在这里是只读的")); return; }
+    let base = t!("Новый архив.zip", "New Compressed (zipped) Folder.zip", ja: "新しい圧縮フォルダー.zip", pt: "Nova pasta compactada.zip", zh: "新建压缩文件夹.zip");
+    match new_entry(dir, base, false) {
+        Ok(p) => {
+            let made = fs::File::create(&p).map_err(|e| e.to_string()).and_then(|f| zipx::Writer::new(f).finish().map(drop).map_err(|e| e.to_string()));
+            if let Err(e) = made { let _ = fs::remove_file(&p); warn(h, &e); return; }
+            reload(h);
+            if let Some(n) = p.file_name() { select_edit(&n.to_string_lossy()); }
+        }
+        Err(e) => warn(h, &e),
+    }
+}
+
+/// Focus the search box (Ctrl+F / Ctrl+E), like Explorer.
+fn search_focus() {
+    let search = ST.with_borrow(|st| st.search);
+    if search == 0 as HWND { return; }
+    unsafe {
+        SetFocus(search);
+        put(search, EM_SETSEL, 0, -1);
+    }
 }
 
 /// Wallpaper for the desktop window.
@@ -1583,6 +1729,25 @@ unsafe extern "system" fn edit_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> 
     }
 }
 
+/// Search box subclass: Enter runs the search, Esc clears it; the rest is the normal edit control.
+unsafe extern "system" fn search_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        if matches!(wp, 13 | 27) && matches!(m, WM_KEYDOWN | WM_CHAR) {
+            if m == WM_KEYDOWN { PostMessageW(GetAncestor(h, GA_ROOT), WM_SEARCH, wp, 0); }
+            return 0;
+        }
+        if m == WM_CHAR && wp == 0x7F { delete_word(h); return 0; }
+        CallWindowProcW(std::mem::transmute::<isize, WNDPROC>(SEARCH_OLD.load(std::sync::atomic::Ordering::Relaxed)), h, m, wp, lp)
+    }
+}
+
+fn edit_text(h: HWND) -> String {
+    let n = unsafe { GetWindowTextLengthW(h) }.max(0) as usize;
+    let mut buf = vec![0u16; n + 1];
+    let n = unsafe { GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32) }.max(0) as usize;
+    String::from_utf16_lossy(&buf[..n])
+}
+
 unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if m == winrust_common::style::msg() {
@@ -1595,15 +1760,21 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_CREATE => {
                 let inst = GetModuleHandleW(ptr::null());
                 // desktop mode has no tab bar / address bar: the null handles are harmless to every SendMessage below
-                let (mut tab, mut edit) = (0 as HWND, 0 as HWND);
+                let (mut tab, mut edit, mut search) = (0 as HWND, 0 as HWND, 0 as HWND);
                 if !desk() {
                     ui::dark_title(h);
-                    // the chrome (tabs, toolbar, address pill) is one painted window; the address box is a real edit inside its pill
+                    // the chrome (tabs, toolbar, address pill) is one painted window; the address and search boxes are real edits
                     tab = CreateWindowExW(0, w("RxChrome").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 0, 0, h, 0 as _, inst, ptr::null());
                     ui::nav_init(CreateWindowExW(0, w("RxNav").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, h, 0 as _, inst, ptr::null()));
                     edit = CreateWindowExW(0, w("EDIT").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32, 0, 0, 0, 0, tab, 0 as _, inst, ptr::null());
-                    put(edit, WM_SETFONT, ui::font(14, 400, ui::ui_face()) as usize, 1);
+                    put(edit, WM_SETFONT, ui::font(13, 400, ui::ui_face()) as usize, 1);
                     EDIT_OLD.store(SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as isize), std::sync::atomic::Ordering::Relaxed);
+                    SHAutoComplete(edit, SHACF_FILESYSTEM | SHACF_AUTOSUGGEST_FORCE_ON);
+                    search = CreateWindowExW(0, w("EDIT").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32, 0, 0, 0, 0, tab, 0 as _, inst, ptr::null());
+                    put(search, WM_SETFONT, ui::font(13, 400, ui::ui_face()) as usize, 1);
+                    SEARCH_OLD.store(SetWindowLongPtrW(search, GWLP_WNDPROC, search_proc as *const () as isize), std::sync::atomic::Ordering::Relaxed);
+                    let cue = t!("Поиск", "Search", ja: "検索", pt: "Pesquisar", zh: "搜索");
+                    SendMessageW(search, 0x1501, 1, w(&cue).as_ptr() as isize); // EM_SETCUEBANNER
                 }
                 let view = if desk() { LVS_ICON } else { LVS_REPORT };
                 let list = CreateWindowExW(0, w("SysListView32").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | view | if desk() { 0 } else { LVS_OWNERDATA } | LVS_EDITLABELS | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS, 0, 0, 0, 0, h, 0 as _, inst, ptr::null());
@@ -1640,7 +1811,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     col(list, 3, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"), ui::sc(96), true);
                     ui::style_list(list);
                 }
-                ST.with_borrow_mut(|st| { st.list = list; st.tab = tab; st.edit = edit; st.tabs = vec![PathBuf::new()]; });
+                ST.with_borrow_mut(|st| { st.list = list; st.tab = tab; st.edit = edit; st.search = search; st.tabs = vec![PathBuf::new()]; });
                 if !desk() { ui::place_edit(tab); }
                 let _ = sh::register_drop(list as _, h as isize);
                 if desk() && icons_hidden() { ShowWindow(list, SW_HIDE); }
@@ -1673,6 +1844,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 }
                 0
             }
+            WM_SETTINGCHANGE if !desk() && lp != 0 && wstr(lp as *const u16).eq_ignore_ascii_case("ImmersiveColorSet") => { ui::theme_invalidate(); ui::restyle(h); 0 }
+            WM_THEMECHANGED if !desk() => { ui::theme_invalidate(); ui::restyle(h); 0 }
             // mouse buttons 4 / 5 (and keyboard media keys) arrive as APPCOMMAND_BROWSER_BACKWARD / _FORWARD
             0x0319 if !desk() && matches!((lp >> 16) & 0x7FF, 1 | 2) => { nav(h, (lp >> 16) & 0x7FF == 1); 1 }
             WM_SIZE => {
@@ -1713,6 +1886,43 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             _ => {}
                         }
                     }
+                    16..=19 => {
+                        let dir = cur_dir();
+                        match wp {
+                            18 => create_new(h, &dir, t!("Новый текстовый документ.txt", "New text document.txt", ja: "新しいテキスト ドキュメント.txt", pt: "Novo documento de texto.txt", zh: "新建文本文档.txt"), false),
+                            19 => new_zip(h, &dir),
+                            _ => {}
+                        }
+                    }
+                    23 => { // a folder from the back / forward history
+                        let i = lp as usize;
+                        if let Some(p) = ST.with_borrow(|st| st.hist.v.get(i).cloned()) {
+                            ST.with_borrow_mut(|st| st.hist.pos = i);
+                            NAV.store(true, Relaxed);
+                            load(h, p);
+                            NAV.store(false, Relaxed);
+                        }
+                    }
+                    24..=31 => match wp {
+                        29 => duplicate_tab(h, lp as usize),
+                        30 => close_other_tabs(h, lp as usize),
+                        31 => copy_tab_path(h, lp as usize),
+                        _ => {}
+                    },
+                    40..=50 => match wp {
+                        44 => select_all(h, false),
+                        45 => select_all(h, true),
+                        46 => copy_path(h),
+                        47 => new_window(),
+                        48 => { let (_, dir, sel) = selected(); properties(&sel.first().cloned().unwrap_or(dir)); }
+                        _ => {}
+                    },
+                    60..=67 => sort_now(h, ((wp - 60) / 2) as usize, (wp - 60) % 2 == 0),
+                    70 | 72 => group_now(h, wp == 72),
+                    81 => set_view(h, true),
+                    85 => set_view(h, false),
+                    93 => toggle_checkboxes(),
+                    95 => { SHOW_HIDDEN.fetch_xor(true, Relaxed); reload(h); }
                     20 => { if let Some(p) = ui::nav_path(lp as usize) { load(h, p); } } // a folder in the left pane
                     21 => { if let Some(p) = ui::crumb_path(lp as usize) { load(h, p); } } // a part of the path in the address pill
                     _ => {}
@@ -1840,7 +2050,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     LVN_KEYDOWN => {
                         let vk = (*(lp as *const NMLVKEYDOWN)).wVKey as u32;
                         let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
-                        if desk() && matches!(vk, 0x08 | 0x46 | 0x4D | 0x54 | 0x57 | 0x09 | 0x4C | 0x73) { return 0; } // browsing keys make no sense on the desktop
+                        let shift = GetKeyState(VK_SHIFT as i32) < 0;
+                        if desk() && matches!(vk, 0x08 | 0x46 | 0x45 | 0x4D | 0x4E | 0x54 | 0x57 | 0x09 | 0x4C | 0x73) { return 0; } // browsing keys make no sense on the desktop
                         let (list, dir, paths) = selected();
                         match vk {
                             0x08 => if let Some(p) = dir.parent() { load(h, p.to_path_buf()) },
@@ -1852,7 +2063,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
                                 if i >= 0 { put(list, LVM_EDITLABELW, i as usize, 0); }
                             }
-                            0x46 if ctrl => { search_focus(); return 0; } // Ctrl+F: address bar in search mode
+                            0x46 | 0x45 if ctrl => { search_focus(); return 0; } // Ctrl+F / Ctrl+E: the search box
                             0x73 | 0x4C if vk == 0x73 || ctrl => { // F4 / Ctrl+L: address bar
                                 let edit = ST.with_borrow(|st| st.edit);
                                 SetFocus(edit);
@@ -1860,6 +2071,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 return 0;
                             }
                             0x5D if !paths.is_empty() => item_menu(h, &dir, &paths),
+                            0x43 if ctrl && shift => { copy_path(h); return 0; } // Ctrl+Shift+C: copy path
                             0x43 | 0x58 if ctrl && !paths.is_empty() => { // from a zip: real files in the temp folder, and only a copy (nothing can be cut out of an archive)
                                 match real_paths(&paths) { Ok(p) => { let _ = sh::clip_set(h, &p, vk == 0x58 && !in_zip()); } Err(e) => warn(h, &e) }
                                 return 0;
@@ -1872,11 +2084,14 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 return 0;
                             }
                             0x56 if ctrl => paste(h, &dir),
-                            0x4E if ctrl => { create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true); return 0; }
+                            0x4E if ctrl && shift => { create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true); return 0; }
+                            0x4E if ctrl => { new_window(); return 0; } // Ctrl+N: a new window, like Explorer
                             0x48 if ctrl => { SHOW_HIDDEN.fetch_xor(true, Relaxed); } // Ctrl+H: hidden files
                             0x74 => {} // F5: just the reload below
                             0x4D if ctrl => { toggle_view(h); return 0; } // Ctrl+M: details <-> thumbnails
+                            0x54 if ctrl && shift => { tab_reopen(h); return 0; } // Ctrl+Shift+T: reopen the closed tab
                             0x54 if ctrl => tab_new(),
+                            0x57 if ctrl && shift => { PostMessageW(h, WM_CLOSE, 0, 0); return 0; } // Ctrl+Shift+W: close the window
                             0x57 if ctrl => { tab_close(h); return 0; }
                             0x09 if ctrl => {
                                 let next = ST.with_borrow(|st| (st.active + 1) % st.tabs.len());
@@ -1923,7 +2138,13 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     1 => nav(h, true),
                     2 => nav(h, false),
                     3 => { let (_, dir, sel) = selected(); properties(&sel.first().cloned().unwrap_or(dir)); }
-                    _ => if let Some(p) = cur_dir().parent() { load(h, p.to_path_buf()) },
+                    4 => if let Some(p) = cur_dir().parent() { load(h, p.to_path_buf()) },
+                    5 => { // Alt+D: the address bar, all selected
+                        let edit = ST.with_borrow(|st| st.edit);
+                        SetFocus(edit);
+                        put(edit, EM_SETSEL, 0, -1);
+                    }
+                    _ => {}
                 }
                 0
             }
@@ -1936,6 +2157,18 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     if ok { put(list, LVM_REDRAWITEMS, row, row as isize); }
                 }
                 windows_sys::Win32::Graphics::Gdi::DeleteObject(bmp as _);
+                0
+            }
+            WM_SEARCH => {
+                let (se, list) = ST.with_borrow(|st| (st.search, st.list));
+                if wp == 13 {
+                    let q = edit_text(se);
+                    if !q.trim().is_empty() { search(h, q.trim()); SetFocus(list); }
+                } else {
+                    SetWindowTextW(se, w("").as_ptr());
+                    if ui::searching() { ui::set_search(None); load(h, cur_dir()); }
+                    SetFocus(list);
+                }
                 0
             }
             WM_GO => {
@@ -2022,7 +2255,7 @@ fn main() {
             SetWindowPos(d, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         } else {
             // where it was last closed, maximized again if it was (#71); a first start gets the default size
-            let win = CreateWindowExW(0, cls.as_ptr(), ptr::null(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, ui::sc(1000), ui::sc(660), 0 as _, 0 as _, inst, ptr::null());
+            let win = CreateWindowExW(0, cls.as_ptr(), ptr::null(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, ui::sc(1100), ui::sc(700), 0 as _, 0 as _, inst, ptr::null());
             match saved_place() {
                 // the same API that saved it: rcNormalPosition is in work-area coordinates, which CreateWindow does not use
                 Some((max, r)) => {
@@ -2039,7 +2272,7 @@ fn main() {
         while GetMessageW(&mut msg, 0 as _, 0, 0) > 0 {
             // Alt+Left / Right / Up / Enter arrive as WM_SYSKEYDOWN at the list, which never reports them: handle them here
             if msg.message == WM_SYSKEYDOWN && !desk() {
-                let act = match msg.wParam { 0x25 => 1, 0x27 => 2, 0x0D => 3, 0x26 => 4, _ => 0 };
+                let act = match msg.wParam { 0x25 => 1, 0x27 => 2, 0x0D => 3, 0x26 => 4, 0x44 => 5, _ => 0 };
                 if act != 0 { PostMessageW(GetAncestor(msg.hwnd, GA_ROOT), WM_NAV, act, 0); continue; }
             }
             TranslateMessage(&msg);

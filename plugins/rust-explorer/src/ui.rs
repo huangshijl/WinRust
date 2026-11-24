@@ -4,18 +4,53 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use super::*;
 use std::{cell::Cell, collections::HashMap, path::Path};
-use windows_sys::Win32::{Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*}, System::{LibraryLoader::{GetProcAddress, LoadLibraryW}, SystemInformation::GetTickCount64}, UI::Input::KeyboardAndMouse::{GetFocus, TRACKMOUSEEVENT, TME_LEAVE, TrackMouseEvent}};
-
-// The colours come from the WinRust style the topbar gear picks (normal, terminal, dock, tiling): the same palette as the bar.
-pub use winrust_common::style::{pal, ui_face};
+use windows_sys::Win32::{Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*}, System::{LibraryLoader::{GetProcAddress, LoadLibraryW}, SystemInformation::GetTickCount64}, UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture, TRACKMOUSEEVENT, TME_LEAVE, TrackMouseEvent}};
 use winrust_common::{lang, Lang, t, tf};
-// sunk surfaces: darker than the window on the dark styles, white on the light one
-pub fn listbg() -> u32 { if winrust_common::style::style().light() { winrust_common::style::card() } else { mix(pal().bg, 0, 0.22) } }
-pub fn pill() -> u32 { if winrust_common::style::style().light() { mix(pal().bg, pal().text, 0.06) } else { mix(pal().bg, 0, 0.35) } }
+
+// The window follows the Windows 11 File Explorer look: the app light/dark theme from Windows, the accent from DWM.
+// It is deliberately independent of the WinRust styles the rest of the suite uses.
+#[derive(Clone, Copy)]
+pub struct Palette { pub bg: u32, pub card: u32, pub text: u32, pub dim: u32, pub line: u32, pub hover: u32, pub active: u32, pub accent: u32, pub pill: u32, pub pill_line: u32, pub sel: u32, pub sel_off: u32, pub row_hover: u32 }
+
+const LIGHT_PAL: Palette = Palette { bg: 0x00F3F3F3, card: 0x00FFFFFF, text: 0x001A1A1A, dim: 0x005F5F5F, line: 0x00E5E5E5, hover: 0x00EAEAEA, active: 0x00DFDFDF, accent: 0x00D77800, pill: 0x00FFFFFF, pill_line: 0x00D6D6D6, sel: 0x00F7E4CC, sel_off: 0x00E9E9E9, row_hover: 0x00F5F5F5 };
+const DARK_PAL: Palette = Palette { bg: 0x00202020, card: 0x00282828, text: 0x00FFFFFF, dim: 0x00A0A0A0, line: 0x00333333, hover: 0x002D2D2D, active: 0x00383838, accent: 0x00D77800, pill: 0x002D2D2D, pill_line: 0x003D3D3D, sel: 0x00664B2D, sel_off: 0x00333333, row_hover: 0x002C2C2C };
+
+fn reg_dword(sub: &str, name: &str) -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let (mut v, mut cb) = (0u32, 4u32);
+    let rc = unsafe { RegGetValueW(HKEY_CURRENT_USER, w(sub).as_ptr(), w(name).as_ptr(), RRF_RT_REG_DWORD, ptr::null_mut(), &mut v as *mut _ as *mut _, &mut cb) };
+    (rc == 0).then_some(v)
+}
+
+fn apps_light() -> bool { reg_dword(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme").unwrap_or(1) != 0 }
+fn system_accent() -> u32 { reg_dword(r"Software\Microsoft\Windows\DWM", "AccentColor").map_or(0x00D77800, |v| v & 0x00FF_FFFF) }
+
+thread_local! { static PAL11: Cell<(u64, Palette)> = const { Cell::new((0, LIGHT_PAL)) }; }
+
+/// The app theme colours, refreshed at most once a second (theme and accent changes come through WM_SETTINGCHANGE).
+pub fn pal() -> Palette {
+    let t = now();
+    let (at, p) = PAL11.get();
+    if at != 0 && t.saturating_sub(at) < 1000 { return p; }
+    let mut p = if apps_light() { LIGHT_PAL } else { DARK_PAL };
+    p.accent = system_accent();
+    PAL11.set((t, p));
+    p
+}
+
+pub fn light() -> bool { apps_light() }
+
+/// The WinRust style changed or Windows switched theme: the next pal() reads the registry again.
+pub fn theme_invalidate() { PAL11.set((0, LIGHT_PAL)); }
+
+pub fn ui_face() -> &'static str { "Segoe UI" }
+
+pub fn listbg() -> u32 { pal().card }
+pub fn pill() -> u32 { pal().pill }
 pub fn off() -> u32 { mix(pal().dim, pal().bg, 0.45) }
 
-pub const CHROME_H: i32 = 88;
-pub const STATUS_H: i32 = 26;
+pub const CHROME_H: i32 = 126;
+pub const STATUS_H: i32 = 24;
 pub const WM_UI: u32 = WM_APP + 4; // chrome -> window: wp = action (see Hit), lp = tab index
 const WM_MOUSELEAVE: u32 = 0x02A3; // not exported under the enabled features
 
@@ -25,12 +60,21 @@ const BACK: i32 = 1;
 const FWD: i32 = 2;
 const UP: i32 = 3;
 const RELOAD: i32 = 4;
-const SEARCH: i32 = 5;
-const VIEW: i32 = 6;
-const PLUS: i32 = 7;
-const CMD: i32 = 10; // + index into CMD_ACTIONS / CMD_GLYPHS
-const CMD_ACTIONS: [usize; 6] = [15, 10, 11, 12, 13, 14]; // new folder, cut, copy, paste, rename, delete
-const CMD_GLYPHS: [&str; 6] = ["\u{E8F4}", "\u{E8C6}", "\u{E8C8}", "\u{E77F}", "\u{E8AC}", "\u{E74D}"];
+const PLUS: i32 = 5;
+const NEW: i32 = 20;
+const NEW_MORE: i32 = 21;
+const CUT: i32 = 22;
+const COPY: i32 = 23;
+const PASTE: i32 = 24;
+const PASTE_MORE: i32 = 25;
+const RENAME: i32 = 26;
+const DELETE: i32 = 27;
+const SHARE: i32 = 28;
+const SORT: i32 = 29;
+const VIEW: i32 = 31;
+const MORE: i32 = 33;
+const SEARCH_BOX: i32 = 34;
+const SEARCH_CLEAR: i32 = 35;
 const TAB: i32 = 100; // + index
 const CLOSE: i32 = 200; // + index
 const CRUMB: i32 = 400; // + index: a part of the path in the address pill
@@ -38,10 +82,16 @@ const CRUMB: i32 = 400; // + index: a part of the path in the address pill
 thread_local! {
     static CRUMBS: RefCell<Vec<(RECT, PathBuf)>> = const { RefCell::new(Vec::new()) }; // where each path part was painted
     static SEARCHING: RefCell<Option<String>> = const { RefCell::new(None) }; // the list shows hits for this query
+    static PENDING_MENU: Cell<i32> = const { Cell::new(NONE) }; // a command-bar menu opens on the button release
+    static TAB_DRAG: Cell<Option<(usize, i32)>> = const { Cell::new(None) }; // (index, start x) of a tab being dragged
+    static TAB_DROP: Cell<usize> = const { Cell::new(0) }; // insertion index while dragging
+    static TAB_MOVED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The list shows search hits for `q` (None: a folder again); the pill says so instead of showing the path.
 pub fn set_search(q: Option<String>) { SEARCHING.set(q); }
+
+pub fn searching() -> bool { SEARCHING.with_borrow(|s| s.is_some()) }
 
 /// Folder of the path part `i` of the address pill.
 pub fn crumb_path(i: usize) -> Option<PathBuf> { CRUMBS.with_borrow(|c| c.get(i).map(|x| x.1.clone())) }
@@ -126,8 +176,8 @@ pub fn font(px: i32, weight: i32, face: &str) -> isize {
 pub fn dark_title(h: HWND) {
     unsafe {
         let set = |attr: u32, v: i32| { DwmSetWindowAttribute(h, attr, &v as *const _ as _, 4); };
-        set(20, !winrust_common::style::style().light() as i32); // immersive dark mode, except on the light style
-        set(33, if winrust_common::style::style().square() { 1 } else { 2 }); // round corners, square in the terminal and tiling styles
+        set(20, !light() as i32); // immersive dark mode when Windows is in the dark app theme
+        set(33, 2); // round corners, like Explorer
         set(35, pal().bg as i32); // caption
         set(36, pal().text as i32); // caption text
         set(34, pal().line as i32); // border
@@ -180,7 +230,7 @@ pub fn style_list(list: HWND) {
     }
 }
 
-pub const ROW_H: i32 = 36;
+pub const ROW_H: i32 = 28;
 
 /// Details rows get ROW_H tall through an empty 1 px wide state image list (a row is as tall as its tallest image).
 /// Off for the thumbnail view, where a state image would take room next to every thumbnail.
@@ -271,28 +321,27 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             FillRect(dc, &row_r, b);
             DeleteObject(b);
             if hdr {
-                // a date heading: only its name, in the accent colour, never highlighted
+                // a date heading: only its name, never highlighted
                 let x0 = r.left;
-                if FONTS.get().0 == 0 { FONTS.set((font(14, 400, ui_face()), font(13, 400, ui_face()))); }
+                if FONTS.get().0 == 0 { FONTS.set((font(13, 400, ui_face()), font(12, 400, ui_face()))); }
                 SetBkMode(dc, TRANSPARENT as i32);
-                let of = SelectObject(dc, FONTS.get().0 as HFONT);
-                text(dc, &name[1..], rc(x0 + sc(16), r.top + sc(8), cr.right, r.bottom), pal().accent, DT_LEFT);
-                fill(dc, rc(sc(16), r.bottom - 1, cr.right - sc(16), r.bottom), pal().line, 0);
+                let f_head = font(13, 600, ui_face()) as HFONT;
+                let of = SelectObject(dc, f_head);
+                text(dc, &name[1..], rc(x0 + sc(16), r.top + sc(4), cr.right, r.bottom), pal().text, DT_LEFT);
                 SelectObject(dc, of);
+                DeleteObject(f_head);
                 return CDRF_SKIPDEFAULT as isize;
             }
             let sel = SendMessageW(list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) as u32 & LVIS_SELECTED != 0;
             let hot = ROWHOT.get() == i as isize;
             let focus = GetFocus() == list;
-            let pill = rc(sc(6), r.top + sc(2), cr.right - sc(6), r.bottom - sc(2));
             let bg = match (sel, focus) {
-                (true, true) => mix(listbg(), pal().accent, if hot { 0.26 } else { 0.20 }),
-                (true, false) => mix(listbg(), pal().text, 0.10),
-                _ if hot => mix(listbg(), pal().text, 0.055),
+                (true, true) => pal().sel,
+                (true, false) => pal().sel_off,
+                _ if hot => pal().row_hover,
                 _ => listbg(),
             };
-            if bg != listbg() { fill(dc, pill, bg, sc(10)); }
-            if sel { fill(dc, rc(pill.left, pill.top + sc(8), pill.left + sc(3), pill.bottom - sc(8)), if focus { pal().accent } else { pal().dim }, sc(3)); }
+            if bg != listbg() { fill(dc, row_r, bg, 0); }
             // columns from the header widths (left of the row = minus the horizontal scroll)
             let cw: Vec<i32> = (0..4).map(|k| SendMessageW(list, LVM_GETCOLUMNWIDTH, k, 0) as i32).collect();
             let x: Vec<i32> = (0..4).map(|k| r.left + cw[..k].iter().sum::<i32>()).collect();
@@ -300,18 +349,18 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             let (mut iw, mut ih) = (0, 0);
             ImageList_GetIconSize(himl as _, &mut iw, &mut ih);
             if icon >= 0 { ImageList_Draw(himl as _, icon, dc, x[0] + sc(16), (r.top + r.bottom - ih) / 2, ILD_TRANSPARENT); }
-            if FONTS.get().0 == 0 { FONTS.set((font(14, 400, ui_face()), font(13, 400, ui_face()))); }
+            if FONTS.get().0 == 0 { FONTS.set((font(13, 400, ui_face()), font(12, 400, ui_face()))); }
             let (f_name, f_det) = FONTS.get();
             SetBkMode(dc, TRANSPARENT as i32);
             let of = SelectObject(dc, f_name as HFONT);
             let p = Path::new(&name);
-            let hit_of_search = p.is_absolute(); // search hits are absolute paths: show the name, and where it lies in the type column
+            let hit_of_search = p.is_absolute(); // search hits are absolute paths: the name column shows just the file name
             let shown = if hit_of_search { p.file_name().map_or(name.clone(), |n| n.to_string_lossy().into_owned()) } else { name.clone() };
             text(dc, &shown, rc(x[0] + sc(16) + iw + sc(12), r.top, x[1] - sc(8), r.bottom), pal().text, DT_LEFT);
             SelectObject(dc, f_det as HFONT);
             let dim = if sel { mix(pal().dim, pal().text, 0.45) } else { pal().dim };
             text(dc, &friendly_date(time), rc(x[1] + sc(10), r.top, x[2] - sc(8), r.bottom), dim, DT_LEFT);
-            let kind = if hit_of_search { p.parent().map_or(String::new(), |d| d.to_string_lossy().into_owned()) } else { type_text(&name, is_dir) };
+            let kind = type_text(&name, is_dir);
             text(dc, &kind, rc(x[2] + sc(10), r.top, x[3] - sc(8), r.bottom), dim, DT_LEFT | DT_PATH_ELLIPSIS);
             if !is_dir { text(dc, &size_text(size), rc(x[3], r.top, x[3] + cw[3] - sc(14), r.bottom), dim, DT_RIGHT); }
             SelectObject(dc, of);
@@ -326,7 +375,7 @@ pub unsafe fn fit_columns(list: HWND) {
     let mut cr: RECT = std::mem::zeroed();
     GetClientRect(list, &mut cr);
     let rest: i32 = (1..4).map(|k| SendMessageW(list, LVM_GETCOLUMNWIDTH, k, 0) as i32).sum();
-    SendMessageW(list, LVM_SETCOLUMNWIDTH, 0, (cr.right - rest).max(sc(200)) as isize);
+    SendMessageW(list, LVM_SETCOLUMNWIDTH, 0, (cr.right - rest).clamp(sc(200), sc(560)) as isize);
 }
 
 /// Repaints one row (hover moved on or off it).
@@ -366,17 +415,16 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
         if nm.hdr.hwndFrom == hdr && nm.hdr.code == NM_CUSTOMDRAW {
             return match nm.dwDrawStage {
                 CDDS_PREPAINT => {
-                    let b = CreateSolidBrush(pal().bg); // the bar behind the columns too
+                    let b = CreateSolidBrush(listbg()); // the bar behind the columns too
                     FillRect(nm.hdc, &nm.rc, b);
                     DeleteObject(b);
                     CDRF_NOTIFYITEMDRAW as isize
                 }
                 CDDS_ITEMPREPAINT => {
                     let (dc, r, i) = (nm.hdc, nm.rc, nm.dwItemSpec);
-                    let b = CreateSolidBrush(pal().bg);
+                    let b = CreateSolidBrush(listbg());
                     FillRect(dc, &r, b);
                     DeleteObject(b);
-                    fill(dc, rc(r.right - 1, r.top + sc(8), r.right, r.bottom - sc(8)), pal().line, 0);
                     let mut buf = [0u16; 128];
                     let mut it: HDITEMW = std::mem::zeroed();
                     it.mask = HDI_TEXT;
@@ -385,7 +433,7 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
                     SendMessageW(hdr, HDM_GETITEMW, i, &mut it as *mut _ as isize);
                     let sorted = SORT_COL.load(Relaxed) == i;
                     let arrow = if !sorted { "" } else if SORT_ASC.load(Relaxed) { "  \u{2191}" } else { "  \u{2193}" };
-                    let f = font(13, if sorted { 600 } else { 400 }, ui_face()) as HFONT;
+                    let f = font(12, if sorted { 600 } else { 400 }, ui_face()) as HFONT;
                     let of = SelectObject(dc, f);
                     SetBkMode(dc, TRANSPARENT as i32);
                     let align = if i == 3 { DT_RIGHT } else { DT_LEFT }; // the size column is right-aligned like its numbers
@@ -403,51 +451,128 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
 
 // ---------- layout and hit testing ----------
 
-struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, back: RECT, fwd: RECT, up: RECT, reload: RECT, pill: RECT, search: RECT, view: RECT, cmds: Vec<RECT> }
+struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, back: RECT, fwd: RECT, up: RECT, reload: RECT, pill: RECT, search: RECT, search_clear: RECT, new: RECT, new_more: RECT, cut: RECT, copy: RECT, paste: RECT, paste_more: RECT, rename: RECT, delete: RECT, share: RECT, sort: RECT, view: RECT, more: RECT, labels: bool, seps: Vec<i32> }
 
 fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT { RECT { left: l, top: t, right: r, bottom: b } }
 
+thread_local! { static LABELW: RefCell<HashMap<String, i32>> = RefCell::new(HashMap::new()); }
+
+/// Width of a command-bar label in the small UI font (cached, so layout is cheap on every paint).
+fn label_w(s: &str) -> i32 {
+    LABELW.with_borrow_mut(|m| *m.entry(s.to_owned()).or_insert_with(|| unsafe {
+        let dc = GetDC(ptr::null_mut());
+        let f = font(12, 400, ui_face());
+        let old = SelectObject(dc, f as HGDIOBJ);
+        let u: Vec<u16> = s.encode_utf16().collect();
+        let mut sz: SIZE = std::mem::zeroed();
+        GetTextExtentPoint32W(dc, u.as_ptr(), u.len() as i32, &mut sz);
+        SelectObject(dc, old);
+        DeleteObject(f as HGDIOBJ);
+        ReleaseDC(ptr::null_mut(), dc);
+        sz.cx
+    }))
+}
+
+/// The Win11 three-row chrome: tabs, navigation + address + search, command bar.
 fn layout(cw: i32, n: usize) -> Layout {
-    let (ty0, ty1) = (sc(8), sc(36));
-    let tw = ((cw - sc(12) * 2 - sc(36)) / n.max(1) as i32 - sc(4)).clamp(sc(90), sc(220));
-    let tabs: Vec<RECT> = (0..n as i32).map(|i| { let l = sc(12) + i * (tw + sc(4)); rc(l, ty0, l + tw, ty1) }).collect();
-    let close = tabs.iter().map(|t| rc(t.right - sc(26), (t.top + t.bottom) / 2 - sc(10), t.right - sc(6), (t.top + t.bottom) / 2 + sc(10))).collect();
-    let px = tabs.last().map_or(sc(12), |t| t.right + sc(4));
-    let plus = rc(px, ty0 + sc(2), px + sc(26), ty1 - sc(2));
-    let (by0, by1, bs) = (sc(44), sc(80), sc(36));
-    let btn = |i: i32| rc(sc(12) + i * (bs + sc(4)), by0, sc(12) + i * (bs + sc(4)) + bs, by1);
-    let view = rc(cw - sc(12) - bs, by0, cw - sc(12), by1);
-    let search = rc(view.left - sc(4) - bs, by0, view.left - sc(4), by1);
-    let reload = btn(3);
-    // command buttons only while the address pill keeps a usable width
-    let cmds: Vec<RECT> = if cw >= sc(900) { (4..10).map(btn).collect() } else { vec![] };
-    let pill = rc(cmds.last().unwrap_or(&reload).right + sc(8), by0, search.left - sc(8), by1);
-    Layout { tabs, close, plus, back: btn(0), fwd: btn(1), up: btn(2), reload, pill, search, view, cmds }
+    let pad = sc(8);
+    let (ty0, ty1) = (sc(5), sc(37));
+    let plus_w = sc(28);
+    let avail = (cw - pad * 2 - plus_w - sc(6)).max(sc(120));
+    let tw = (avail / n.max(1) as i32).clamp(sc(110), sc(240));
+    let tabs: Vec<RECT> = (0..n as i32).map(|i| { let l = pad + i * (tw + sc(4)); rc(l, ty0, l + tw, ty1) }).collect();
+    let close = tabs.iter().map(|t| rc(t.right - sc(26), (t.top + t.bottom) / 2 - sc(9), t.right - sc(8), (t.top + t.bottom) / 2 + sc(9))).collect();
+    let px = tabs.last().map_or(pad, |t| t.right + sc(4));
+    let plus = rc(px, ty0 + sc(3), px + plus_w, ty1 - sc(3));
+
+    let (ny0, ny1) = (sc(43), sc(79));
+    let bs = sc(32);
+    let nav = |i: i32| rc(pad + i * (bs + sc(2)), ny0, pad + i * (bs + sc(2)) + bs, ny1);
+    let search_w = (cw / 4).clamp(sc(150), sc(280));
+    let search = rc(cw - sc(12) - search_w, ny0, cw - sc(12), ny1);
+    let search_clear = rc(search.right - sc(28), search.top + sc(4), search.right - sc(4), search.bottom - sc(4));
+    let reload = nav(3);
+    let pill = rc(reload.right + sc(8), ny0, (search.left - sc(10)).max(reload.right + sc(140)), ny1);
+
+    let (cy0, cy1) = (sc(85), sc(119));
+    let labels = cw >= sc(1060);
+    let btn = |x: i32, w: i32| rc(x, cy0, x + w, cy1);
+    let [l_new, l_cut, l_copy, l_paste, l_rename, l_delete, l_share, l_sort, l_view] = [
+        t!("Создать", "New", ja: "新規作成", pt: "Novo", zh: "新建"),
+        t!("Вырезать", "Cut", ja: "切り取り", pt: "Recortar", zh: "剪切"),
+        t!("Копировать", "Copy", ja: "コピー", pt: "Copiar", zh: "复制"),
+        t!("Вставить", "Paste", ja: "貼り付け", pt: "Colar", zh: "粘贴"),
+        t!("Переименовать", "Rename", ja: "名前の変更", pt: "Renomear", zh: "重命名"),
+        t!("Удалить", "Delete", ja: "削除", pt: "Excluir", zh: "删除"),
+        t!("Общий доступ", "Share", ja: "共有", pt: "Compartilhar", zh: "共享"),
+        t!("Сортировка", "Sort", ja: "並べ替え", pt: "Classificar", zh: "排序"),
+        t!("Просмотр", "View", ja: "表示", pt: "Exibir", zh: "查看"),
+    ];
+    let item = |label: &str| if labels { sc(10) + sc(16) + sc(7) + label_w(label) + sc(10) } else { sc(40) };
+    let mut x = pad;
+    let new_main = if labels { sc(10) + sc(16) + sc(7) + label_w(l_new) + sc(6) } else { sc(34) };
+    let new_chev = sc(20);
+    let new = btn(x, new_main);
+    let new_more = rc(x + new_main, cy0, x + new_main + new_chev, cy1);
+    x += new_main + new_chev;
+    let mut seps = vec![];
+    x += sc(4); seps.push(x); x += sc(5);
+    let cut = btn(x, item(l_cut)); x += cut.right - cut.left + sc(2);
+    let copy = btn(x, item(l_copy)); x += copy.right - copy.left + sc(2);
+    let paste_w = item(l_paste);
+    let paste = btn(x, paste_w);
+    let paste_more = rc(x + paste_w, cy0, x + paste_w + new_chev, cy1);
+    x += paste_w + new_chev + sc(2);
+    let rename = btn(x, item(l_rename)); x += rename.right - rename.left + sc(2);
+    let delete = btn(x, item(l_delete)); x += delete.right - delete.left + sc(2);
+    let share = if cw >= sc(620) { let r = btn(x, item(l_share)); x = r.right + sc(2); r } else { rc(0, 0, 0, 0) };
+    seps.push(x + sc(2)); x += sc(9);
+    let more = rc(cw - pad - sc(40), cy0, cw - pad, cy1);
+    let view_w = if labels { sc(10) + sc(16) + sc(7) + label_w(l_view) + sc(8) + sc(12) } else { sc(54) };
+    let view = rc(more.left - sc(4) - view_w, cy0, more.left - sc(4), cy1);
+    let sort_w = if labels { sc(10) + sc(16) + sc(7) + label_w(l_sort) + sc(8) + sc(12) } else { sc(54) };
+    let sort = rc(view.left - sc(2) - sort_w, cy0, view.left - sc(2), cy1);
+    let _ = x;
+
+    Layout { tabs, close, plus, back: nav(0), fwd: nav(1), up: nav(2), reload, pill, search, search_clear, new, new_more, cut, copy, paste, paste_more, rename, delete, share, sort, view, more, labels, seps }
 }
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool { x >= r.left && x < r.right && y >= r.top && y < r.bottom }
 
 fn hit(l: &Layout, x: i32, y: i32) -> i32 {
-    for (i, c) in l.close.iter().enumerate() { if inside(c, x, y) && l.tabs.len() > 1 { return CLOSE + i as i32; } }
+    for (i, c) in l.close.iter().enumerate() { if inside(c, x, y) { return CLOSE + i as i32; } }
     for (i, t) in l.tabs.iter().enumerate() { if inside(t, x, y) { return TAB + i as i32; } }
-    for (k, r) in [(BACK, &l.back), (FWD, &l.fwd), (UP, &l.up), (RELOAD, &l.reload), (SEARCH, &l.search), (VIEW, &l.view), (PLUS, &l.plus)] {
+    for (k, r) in [(BACK, &l.back), (FWD, &l.fwd), (UP, &l.up), (RELOAD, &l.reload), (PLUS, &l.plus)] {
         if inside(r, x, y) { return k; }
     }
-    for (i, r) in l.cmds.iter().enumerate() { if inside(r, x, y) { return CMD + i as i32; } }
+    if inside(&l.new_more, x, y) { return NEW_MORE; }
+    if inside(&l.new, x, y) { return NEW; }
+    if inside(&l.paste_more, x, y) { return PASTE_MORE; }
+    if inside(&l.paste, x, y) { return PASTE; }
+    for (k, r) in [(CUT, &l.cut), (COPY, &l.copy), (RENAME, &l.rename), (DELETE, &l.delete), (SHARE, &l.share), (SORT, &l.sort), (VIEW, &l.view), (MORE, &l.more)] {
+        if r.right > r.left && inside(r, x, y) { return k; }
+    }
+    if inside(&l.search_clear, x, y) { return SEARCH_CLEAR; }
+    if inside(&l.search, x, y) { return SEARCH_BOX; }
     NONE
 }
 
-/// Puts the address box inside the pill.
+/// Puts the address and search boxes inside their pills.
 pub fn place_edit(chrome: HWND) {
     unsafe {
-        let edit = ST.with(|c| c.try_borrow().map_or(ptr::null_mut(), |s| s.edit));
+        let (edit, search) = ST.with(|c| c.try_borrow().map_or((ptr::null_mut(), ptr::null_mut()), |s| (s.edit, s.search)));
         if edit.is_null() { return; }
         let mut r: RECT = std::mem::zeroed();
         GetClientRect(chrome, &mut r);
-        let p = layout(r.right, 1).pill;
+        let l = layout(r.right, 1);
         let eh = sc(20);
-        MoveWindow(edit, p.left + sc(40), (p.top + p.bottom - eh) / 2, (p.right - p.left - sc(40) - sc(16)).max(0), eh, 1);
+        MoveWindow(edit, l.pill.left + sc(36), (l.pill.top + l.pill.bottom - eh) / 2, (l.pill.right - l.pill.left - sc(36) - sc(14)).max(0), eh, 1);
         if GetFocus() != edit { ShowWindow(edit, SW_HIDE); } // the path parts are painted instead until the pill is clicked
+        if !search.is_null() {
+            let sx = l.search.left + sc(32);
+            MoveWindow(search, sx, (l.search.top + l.search.bottom - eh) / 2, (l.search.right - sc(32) - sx).max(0), eh, 1);
+            ShowWindow(search, SW_SHOW);
+        }
     }
 }
 
@@ -465,7 +590,6 @@ pub fn gdiplus_start() {
 
 /// Fills `r` (right / bottom exclusive) in `c`; `rad` > 0 rounds the corners (rad = corner diameter), anti-aliased.
 unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
-    let rad = if winrust_common::style::style().square() { 0 } else { rad };
     use windows_sys::Win32::Graphics::GdiPlus::*;
     let (wd, ht) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
     if wd <= 0.0 || ht <= 0.0 { return; }
@@ -512,111 +636,181 @@ unsafe fn glow(dc: HDC, key: i32, r: RECT, base: u32, to: u32, rad: i32, on: boo
     if t > 0.01 || p > 0.0 { fill(dc, r, mix(mix(base, to, t), pal().accent, 0.45 * p), rad); }
 }
 
+fn selected_count() -> usize {
+    ST.with_borrow(|st| {
+        let (mut n, mut i) = (0usize, -1isize);
+        loop {
+            i = unsafe { SendMessageW(st.list, LVM_GETNEXTITEM, i as usize, LVNI_SELECTED as isize) };
+            let Some(r) = usize::try_from(i).ok().and_then(|i| st.rows.get(i)) else { break };
+            if !r.hdr { n += 1; }
+        }
+        n
+    })
+}
+
+fn tab_bg() -> u32 { mix(pal().bg, pal().card, 0.6) }
+
 unsafe fn paint_chrome(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let wdc = BeginPaint(hwnd, &mut ps);
     let mut cr: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut cr);
     // everything painting needs from the window state, copied out so nothing is borrowed while drawing
-    let snap = ST.with(|c| c.try_borrow().ok().map(|s| (s.tabs.iter().map(label).collect::<Vec<_>>(), s.active, s.hist.pos > 0, s.hist.pos + 1 < s.hist.v.len(), s.thumbs, s.edit, s.dir.clone())));
-    let Some((labels, active, can_back, can_fwd, thumbs, edit, dir)) = snap else { EndPaint(hwnd, &ps); return };
+    let snap = ST.with(|c| c.try_borrow().ok().map(|s| (s.tabs.iter().map(label).collect::<Vec<_>>(), s.active, s.hist.pos > 0, s.hist.pos + 1 < s.hist.v.len(), s.edit, s.search, s.dir.clone())));
+    let Some((tab_labels, active, can_back, can_fwd, edit, search, dir)) = snap else { EndPaint(hwnd, &ps); return };
     BUSY.set(false);
     let (dc, bmp) = (CreateCompatibleDC(wdc), CreateCompatibleBitmap(wdc, cr.right, cr.bottom));
     let old = SelectObject(dc, bmp);
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
-    winrust_common::style::backdrop(dc, cr, sc(100) as f32 / 100.0);
     SetBkMode(dc, TRANSPARENT as i32);
-    let l = layout(cr.right, labels.len());
+    let l = layout(cr.right, tab_labels.len());
     let hot = HOT.get();
-    let (f_txt, f_glyph, f_small) = (font(13, 400, ui_face()) as HFONT, font(16, 400, winrust_common::style::icon_face()) as HFONT, font(12, 400, winrust_common::style::icon_face()) as HFONT);
+    let (f_txt, f_cmd, f_glyph, f_small) = (font(13, 400, ui_face()) as HFONT, font(12, 400, ui_face()) as HFONT, font(16, 400, winrust_common::style::icon_face()) as HFONT, font(11, 400, winrust_common::style::icon_face()) as HFONT);
     let of = SelectObject(dc, f_txt);
+    let sel = selected_count();
+    let zip = crate::in_zip();
 
     // tabs
     for (i, t) in l.tabs.iter().enumerate() {
         let on = i == active;
-        let (th, ta) = (hv(TAB + i as i32, hot == TAB + i as i32 || hot == CLOSE + i as i32), hv(1000 + i as i32, on));
-        let p = press_t(TAB + i as i32);
-        fill(dc, *t, mix(mix(mix(pal().bg, pal().hover, th), pal().active, ta), pal().accent, 0.35 * p), sc(8));
-        if ta > 0.01 { fill(dc, rc(t.left + (t.right - t.left) / 2 - sc(12), t.bottom - sc(3), t.left + (t.right - t.left) / 2 + sc(12), t.bottom), mix(pal().active, pal().accent, ta), sc(3)); }
+        let th = hv(TAB + i as i32, hot == TAB + i as i32 || hot == CLOSE + i as i32);
+        if on {
+            fill(dc, *t, tab_bg(), sc(6));
+            fill(dc, rc(t.left + (t.right - t.left) / 2 - sc(10), t.bottom - sc(2), t.left + (t.right - t.left) / 2 + sc(10), t.bottom), pal().accent, sc(2));
+        } else if th > 0.01 {
+            fill(dc, *t, mix(pal().bg, pal().hover, th), sc(6));
+        }
         SelectObject(dc, f_txt);
-        text(dc, &labels[i], rc(t.left + sc(14), t.top, t.right - sc(if labels.len() > 1 { 30 } else { 10 }), t.bottom), mix(pal().dim, pal().text, ta.max(th)), DT_LEFT);
-        if labels.len() > 1 && (on || th > 0.05) {
+        text(dc, &tab_labels[i], rc(t.left + sc(12), t.top, t.right - sc(if tab_labels.len() > 1 { 28 } else { 10 }), t.bottom), if on { pal().text } else { mix(pal().dim, pal().text, th) }, DT_LEFT);
+        if on || th > 0.05 {
             let c = l.close[i];
-            glow(dc, CLOSE + i as i32, c, mix(pal().bg, pal().active, ta), pal().hover, sc(6), hot == CLOSE + i as i32);
+            glow(dc, CLOSE + i as i32, c, if on { tab_bg() } else { mix(pal().bg, pal().hover, th) }, pal().hover, sc(4), hot == CLOSE + i as i32);
             SelectObject(dc, f_small);
-            text(dc, "\u{E711}", c, mix(pal().dim, pal().text, if hot == CLOSE + i as i32 { 1.0 } else { 0.4 }), DT_CENTER);
+            text(dc, "\u{E711}", c, if hot == CLOSE + i as i32 { pal().text } else { pal().dim }, DT_CENTER);
         }
     }
-    glow(dc, PLUS, l.plus, pal().bg, pal().hover, sc(6), hot == PLUS);
+    glow(dc, PLUS, l.plus, pal().bg, pal().hover, sc(4), hot == PLUS);
     SelectObject(dc, f_small);
     text(dc, "\u{E710}", l.plus, pal().dim, DT_CENTER);
-
-    // toolbar buttons
-    SelectObject(dc, f_glyph);
-    for (k, r, g, enabled) in [(BACK, l.back, "\u{E72B}", can_back), (FWD, l.fwd, "\u{E72A}", can_fwd), (UP, l.up, "\u{E74A}", true), (RELOAD, l.reload, "\u{E72C}", true), (SEARCH, l.search, "\u{E721}", true), (VIEW, l.view, if thumbs { "\u{E8FD}" } else { "\u{E80A}" }, true)] {
-        if enabled { glow(dc, k, r, pal().bg, pal().hover, sc(8), hot == k); }
-        text(dc, g, r, if enabled { pal().text } else { off() }, DT_CENTER);
+    if TAB_DRAG.get().is_some() && TAB_MOVED.get() {
+        let to = TAB_DROP.get().min(l.tabs.len());
+        let x = if to < l.tabs.len() { l.tabs[to].left - sc(2) } else { l.tabs.last().map_or(sc(8), |t| t.right + sc(2)) };
+        fill(dc, rc(x, sc(4), x + sc(2), sc(38)), pal().accent, 1); // where the tab will land
     }
 
-    for (i, r) in l.cmds.iter().enumerate() {
-        glow(dc, CMD + i as i32, *r, pal().bg, pal().hover, sc(8), hot == CMD + i as i32);
-        text(dc, CMD_GLYPHS[i], *r, pal().text, DT_CENTER);
+    // navigation buttons
+    SelectObject(dc, f_glyph);
+    for (k, r, g, enabled) in [(BACK, l.back, "\u{E72B}", can_back), (FWD, l.fwd, "\u{E72A}", can_fwd), (UP, l.up, "\u{E74A}", true), (RELOAD, l.reload, "\u{E72C}", true)] {
+        if enabled { glow(dc, k, r, pal().bg, pal().hover, sc(4), hot == k); }
+        text(dc, g, r, if enabled { pal().text } else { off() }, DT_CENTER);
     }
 
     // address pill: accent outline while it is being edited
     let focused = !edit.is_null() && GetFocus() == edit;
     let f = hv(2000, focused);
-    fill(dc, l.pill, mix(pal().line, pal().accent, f), sc(18));
-    fill(dc, rc(l.pill.left + 1, l.pill.top + 1, l.pill.right - 1, l.pill.bottom - 1), pill(), sc(17));
+    fill(dc, l.pill, mix(pal().pill_line, pal().accent, f), sc(6));
+    fill(dc, rc(l.pill.left + 1, l.pill.top + 1, l.pill.right - 1, l.pill.bottom - 1), pal().pill, sc(5));
     SelectObject(dc, f_glyph);
-    let searching = SEARCHING.with_borrow(|s| s.clone());
-    text(dc, if searching.is_some() { "\u{E721}" } else { "\u{E838}" }, rc(l.pill.left + sc(10), l.pill.top, l.pill.left + sc(38), l.pill.bottom), mix(pal().dim, pal().accent, f), DT_CENTER);
+    text(dc, "\u{E8B7}", rc(l.pill.left + sc(8), l.pill.top, l.pill.left + sc(32), l.pill.bottom), pal().dim, DT_CENTER);
     // not being edited: the path as clickable parts, like Windows 11 Explorer ("C: > Users > me"); the edit box is hidden
     let mut crumbs = vec![];
     if !focused {
-        let (x0, x1) = (l.pill.left + sc(40), l.pill.right - sc(12));
+        let (x0, x1) = (l.pill.left + sc(36), l.pill.right - sc(12));
         let (t, b) = (l.pill.top + sc(5), l.pill.bottom - sc(5));
-        if let Some(q) = &searching {
+        let parts = crumbs_of(&dir);
+        let width = |s: &str| { let mut r = rc(0, 0, 0, 0); DrawTextW(dc, w(s).as_ptr(), -1, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX); r.right + sc(14) };
+        let chev = sc(16);
+        SelectObject(dc, f_txt);
+        let ws: Vec<i32> = parts.iter().map(|p| width(&p.0)).collect();
+        // too long: drop parts from the left; a "..." part then opens the last one dropped
+        let mut first = 0;
+        while first + 1 < parts.len() && ws[first..].iter().sum::<i32>() + chev * (parts.len() - first) as i32 + width("\u{2026}") > x1 - x0 { first += 1; }
+        let mut shown: Vec<(String, PathBuf, i32)> = vec![];
+        if first > 0 { shown.push(("\u{2026}".into(), parts[first - 1].1.clone(), width("\u{2026}"))); }
+        shown.extend(parts[first..].iter().zip(&ws[first..]).map(|(p, &wd)| (p.0.clone(), p.1.clone(), wd)));
+        let mut x = x0;
+        let last = shown.len().saturating_sub(1);
+        for (i, (part, path, wd)) in shown.into_iter().enumerate() {
+            let r = rc(x, t, (x + wd).min(x1), b);
+            glow(dc, CRUMB + i as i32, r, pal().pill, pal().hover, sc(4), hot == CRUMB + i as i32);
             SelectObject(dc, f_txt);
-            let title = tf!("Результаты по запросу «{}»", "Results for \u{201C}{}\u{201D}", ja: "「{}」の検索結果", pt: "Resultados de \u{201C}{}\u{201D}", zh: "“{}”的搜索结果", q);
-            text(dc, &title, rc(x0 + sc(6), l.pill.top, x1, l.pill.bottom), pal().accent, DT_LEFT);
-        } else {
-            let parts = crumbs_of(&dir);
-            let width = |s: &str| { let mut r = rc(0, 0, 0, 0); DrawTextW(dc, w(s).as_ptr(), -1, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX); r.right + sc(16) };
-            let chev = sc(18);
-            SelectObject(dc, f_txt);
-            let ws: Vec<i32> = parts.iter().map(|p| width(&p.0)).collect();
-            // too long: drop parts from the left; a "..." part then opens the last one dropped
-            let mut first = 0;
-            while first + 1 < parts.len() && ws[first..].iter().sum::<i32>() + chev * (parts.len() - first) as i32 + width("\u{2026}") > x1 - x0 { first += 1; }
-            let mut shown: Vec<(String, PathBuf, i32)> = vec![];
-            if first > 0 { shown.push(("\u{2026}".into(), parts[first - 1].1.clone(), width("\u{2026}"))); }
-            shown.extend(parts[first..].iter().zip(&ws[first..]).map(|(p, &wd)| (p.0.clone(), p.1.clone(), wd)));
-            let mut x = x0;
-            let last = shown.len().saturating_sub(1);
-            for (i, (label, path, wd)) in shown.into_iter().enumerate() {
-                let r = rc(x, t, (x + wd).min(x1), b);
-                glow(dc, CRUMB + i as i32, r, pill(), pal().hover, sc(8), hot == CRUMB + i as i32);
-                SelectObject(dc, f_txt);
-                text(dc, &label, r, if i == last { pal().text } else { mix(pal().dim, pal().text, if hot == CRUMB + i as i32 { 1.0 } else { 0.35 }) }, DT_CENTER);
-                crumbs.push((r, path));
-                x = r.right;
-                if i < last {
-                    SelectObject(dc, f_small);
-                    text(dc, "\u{E76C}", rc(x, t, x + chev, b), mix(pal().dim, pill(), 0.3), DT_CENTER);
-                    x += chev;
-                }
+            text(dc, &part, r, if i == last { pal().text } else { mix(pal().dim, pal().text, if hot == CRUMB + i as i32 { 1.0 } else { 0.35 }) }, DT_CENTER);
+            crumbs.push((r, path));
+            x = r.right;
+            if i < last {
+                SelectObject(dc, f_small);
+                text(dc, "\u{E76C}", rc(x, t, x + chev, b), pal().dim, DT_CENTER);
+                x += chev;
             }
         }
     }
     CRUMBS.set(crumbs);
 
+    // search box
+    let s_focus = !search.is_null() && GetFocus() == search;
+    let sf = hv(2100, s_focus);
+    fill(dc, l.search, mix(pal().pill_line, pal().accent, sf), sc(6));
+    fill(dc, rc(l.search.left + 1, l.search.top + 1, l.search.right - 1, l.search.bottom - 1), pal().pill, sc(5));
+    SelectObject(dc, f_small);
+    text(dc, "\u{E721}", rc(l.search.left + sc(8), l.search.top, l.search.left + sc(30), l.search.bottom), if s_focus { pal().accent } else { pal().dim }, DT_CENTER);
+    if !search.is_null() && GetWindowTextLengthW(search) > 0 {
+        glow(dc, SEARCH_CLEAR, l.search_clear, pal().pill, pal().hover, sc(4), hot == SEARCH_CLEAR);
+        text(dc, "\u{E711}", l.search_clear, pal().dim, DT_CENTER);
+    }
+
+    // command bar: New, cut / copy / paste / rename / delete / share, then sort / view / more
+    let (cut_on, copy_on, paste_on, rename_on, delete_on, share_on, new_on) = (sel > 0 && !zip, sel > 0, !zip, sel == 1 && !zip, sel > 0 && !zip, false, !zip);
+    let [c_new, c_cut, c_copy, c_paste, c_rename, c_delete, c_share, c_sort, c_view] = [
+        t!("Создать", "New", ja: "新規作成", pt: "Novo", zh: "新建"),
+        t!("Вырезать", "Cut", ja: "切り取り", pt: "Recortar", zh: "剪切"),
+        t!("Копировать", "Copy", ja: "コピー", pt: "Copiar", zh: "复制"),
+        t!("Вставить", "Paste", ja: "貼り付け", pt: "Colar", zh: "粘贴"),
+        t!("Переименовать", "Rename", ja: "名前の変更", pt: "Renomear", zh: "重命名"),
+        t!("Удалить", "Delete", ja: "削除", pt: "Excluir", zh: "删除"),
+        t!("Общий доступ", "Share", ja: "共有", pt: "Compartilhar", zh: "共享"),
+        t!("Сортировка", "Sort", ja: "並べ替え", pt: "Classificar", zh: "排序"),
+        t!("Просмотр", "View", ja: "表示", pt: "Exibir", zh: "查看"),
+    ];
+    unsafe fn cmd(dc: HDC, key: i32, r: RECT, glyph: &str, label: &str, enabled: bool, hot: i32, labels: bool, f_glyph: HFONT, f_cmd: HFONT, off: u32) {
+        if enabled { glow(dc, key, r, pal().bg, pal().hover, sc(4), hot == key); }
+        let (gx, gx1) = (r.left + sc(if labels { 10 } else { 0 }), r.left + sc(if labels { 26 } else { 40 }));
+        SelectObject(dc, f_glyph);
+        text(dc, glyph, rc(gx, r.top, gx1, r.bottom), if enabled { pal().text } else { off }, DT_CENTER);
+        if labels {
+            SelectObject(dc, f_cmd);
+            text(dc, label, rc(r.left + sc(32), r.top, r.right - sc(6), r.bottom), if enabled { pal().text } else { off }, DT_LEFT);
+        }
+    }
+    cmd(dc, NEW, l.new, "\u{E710}", c_new, new_on, hot, l.labels, f_glyph, f_cmd, off());
+    glow(dc, NEW_MORE, l.new_more, pal().bg, pal().hover, sc(4), hot == NEW_MORE);
+    SelectObject(dc, f_small);
+    text(dc, "\u{E70D}", l.new_more, pal().dim, DT_CENTER);
+    cmd(dc, CUT, l.cut, "\u{E8C6}", c_cut, cut_on, hot, l.labels, f_glyph, f_cmd, off());
+    cmd(dc, COPY, l.copy, "\u{E8C8}", c_copy, copy_on, hot, l.labels, f_glyph, f_cmd, off());
+    cmd(dc, PASTE, l.paste, "\u{E77F}", c_paste, paste_on, hot, l.labels, f_glyph, f_cmd, off());
+    glow(dc, PASTE_MORE, l.paste_more, pal().bg, pal().hover, sc(4), hot == PASTE_MORE);
+    SelectObject(dc, f_small);
+    text(dc, "\u{E70D}", l.paste_more, pal().dim, DT_CENTER);
+    cmd(dc, RENAME, l.rename, "\u{E8AC}", c_rename, rename_on, hot, l.labels, f_glyph, f_cmd, off());
+    cmd(dc, DELETE, l.delete, "\u{E74D}", c_delete, delete_on, hot, l.labels, f_glyph, f_cmd, off());
+    if l.share.right > l.share.left { cmd(dc, SHARE, l.share, "\u{E72D}", c_share, share_on, hot, l.labels, f_glyph, f_cmd, off()); }
+    for x in &l.seps { fill(dc, rc(*x, sc(91), *x + 1, sc(113)), pal().line, 0); }
+    cmd(dc, SORT, l.sort, "\u{E8CB}", c_sort, true, hot, l.labels, f_glyph, f_cmd, off());
+    SelectObject(dc, f_small);
+    text(dc, "\u{E70D}", rc(l.sort.right - sc(16), l.sort.top, l.sort.right - sc(2), l.sort.bottom), pal().dim, DT_CENTER);
+    cmd(dc, VIEW, l.view, "\u{E890}", c_view, true, hot, l.labels, f_glyph, f_cmd, off());
+    SelectObject(dc, f_small);
+    text(dc, "\u{E70D}", rc(l.view.right - sc(16), l.view.top, l.view.right - sc(2), l.view.bottom), pal().dim, DT_CENTER);
+    glow(dc, MORE, l.more, pal().bg, pal().hover, sc(4), hot == MORE);
+    SelectObject(dc, f_glyph);
+    text(dc, "\u{E712}", l.more, pal().text, DT_CENTER);
+
     fill(dc, rc(0, cr.bottom - 1, cr.right, cr.bottom), pal().line, 0); // hairline under the chrome
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, of);
-    for f in [f_txt, f_glyph, f_small] { DeleteObject(f); }
+    for f in [f_txt, f_cmd, f_glyph, f_small] { DeleteObject(f); }
     SelectObject(dc, old);
     DeleteObject(bmp);
     DeleteDC(dc);
@@ -634,42 +828,28 @@ pub unsafe fn paint_status(h: HWND) {
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &strip, bg);
     DeleteObject(bg);
-    winrust_common::style::backdrop(dc, strip, sc(100) as f32 / 100.0);
     fill(dc, rc(0, strip.top, cr.right, strip.top + 1), pal().line, 0); // hairline above the status line
     let snap = ST.with(|c| {
         c.try_borrow().ok().map(|s| {
-            // selected count and the total size of the selected files
-            let (mut n, mut bytes, mut i) = (0usize, 0u64, -1isize);
+            // selected count: the status line counts rows the way Explorer does
+            let (mut n, mut i) = (0usize, -1isize);
             loop {
                 i = SendMessageW(s.list, LVM_GETNEXTITEM, i as usize, LVNI_SELECTED as isize);
                 let Some(r) = usize::try_from(i).ok().and_then(|i| s.rows.get(i)) else { break };
                 if r.hdr { continue; }
                 n += 1;
-                if !r.dir { bytes += r.size; }
             }
-            (s.rows.iter().filter(|r| !r.hdr).count(), n, bytes)
+            (s.rows.iter().filter(|r| !r.hdr).count(), n)
         })
     });
-    if let Some((n, sel, bytes)) = snap {
+    if let Some((n, sel)) = snap {
         let selected = |s: usize| tf!("выбрано: {}", "{} selected", ja: "{} 個選択", pt: "{} selecionado(s)", zh: "已选择 {} 项", s);
-        let left = match (sel, bytes) {
-            (0, _) => items_text(n),
-            (s, 0) => format!("{}  \u{00B7}  {}", items_text(n), selected(s)),
-            (s, b) => format!("{}  \u{00B7}  {}  \u{00B7}  {}", items_text(n), selected(s), size_text(b)),
-        };
+        let left = if sel == 0 { items_text(n) } else { format!("{}  \u{00B7}  {}", items_text(n), selected(sel)) };
         let left = crate::jobs::status_text().unwrap_or(left); // a copy, packing or unpacking in progress
-        let by = [
-            t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称"),
-            t!("Дата", "Date", ja: "日付", pt: "Data", zh: "日期"),
-            t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型"),
-            t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"),
-        ][SORT_COL.load(Relaxed).min(3)];
-        let right = format!("{by} {}", if SORT_ASC.load(Relaxed) { "\u{2191}" } else { "\u{2193}" });
         let f = font(12, 400, ui_face()) as HFONT;
         let of = SelectObject(dc, f);
         SetBkMode(dc, TRANSPARENT as i32);
-        text(dc, &left, rc(strip.left + sc(14), strip.top, strip.right / 2, strip.bottom), pal().dim, DT_LEFT);
-        text(dc, &right, rc(strip.right / 2, strip.top, strip.right - sc(14), strip.bottom), pal().dim, DT_RIGHT);
+        text(dc, &left, rc(strip.left + sc(14), strip.top, strip.right - sc(14), strip.bottom), pal().dim, DT_LEFT);
         SelectObject(dc, of);
         DeleteObject(f);
     }
@@ -685,6 +865,158 @@ pub unsafe fn status_dirty(h: HWND) {
 
 // ---------- chrome window ----------
 
+// ---------- command-bar dropdowns (native menus for now; the multi-column menu comes in P4) ----------
+
+/// (id, label, enabled, checked)
+unsafe fn popup_at(h: HWND, at: RECT, items: &[(u32, String, bool, bool)]) -> u32 {
+    let m = CreatePopupMenu();
+    for (id, label, enabled, checked) in items {
+        let flags = MF_STRING | if *enabled { 0 } else { MF_GRAYED } | if *checked { MF_CHECKED } else { 0 };
+        AppendMenuW(m, flags, *id as usize, w(label).as_ptr());
+    }
+    let mut pt = POINT { x: at.left, y: at.bottom + sc(2) };
+    ClientToScreen(h, &mut pt);
+    let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, h, ptr::null());
+    DestroyMenu(m);
+    id as u32
+}
+
+unsafe fn new_menu(h: HWND, at: RECT) {
+    let items = [
+        (15u32, t!("Папка", "Folder", ja: "フォルダー", pt: "Pasta", zh: "文件夹").to_string(), true, false),
+        (42, t!("Ярлык", "Shortcut", ja: "ショートカット", pt: "Atalho", zh: "快捷方式").to_string(), false, false),
+        (18, t!("Текстовый документ", "Text document", ja: "テキスト ドキュメント", pt: "Documento de texto", zh: "文本文档").to_string(), true, false),
+        (43, t!("Точечный рисунок", "Bitmap image", ja: "ビットマップ イメージ", pt: "Imagem de bitmap", zh: "位图图像").to_string(), false, false),
+        (19, t!("Сжатая ZIP-папка", "Compressed (zipped) folder", ja: "圧縮 (zip 形式) フォルダー", pt: "Pasta compactada (zip)", zh: "压缩(zipped)文件夹").to_string(), true, false),
+    ];
+    let id = popup_at(h, at, &items);
+    if id != 0 { PostMessageW(GetParent(h), WM_UI, id as usize, 0); }
+}
+
+unsafe fn paste_menu(h: HWND, at: RECT) {
+    let items = [
+        (12u32, t!("Вставить", "Paste", ja: "貼り付け", pt: "Colar", zh: "粘贴").to_string(), true, false),
+        (41, t!("Вставить ярлык", "Paste shortcut", ja: "ショートカットの貼り付け", pt: "Colar atalho", zh: "粘贴快捷方式").to_string(), false, false),
+    ];
+    let id = popup_at(h, at, &items);
+    if id != 0 { PostMessageW(GetParent(h), WM_UI, id as usize, 0); }
+}
+
+unsafe fn sort_menu(h: HWND, at: RECT) {
+    let col = SORT_COL.load(Relaxed);
+    let asc = SORT_ASC.load(Relaxed);
+    let items = [
+        (60u32, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称").to_string(), true, col == 0),
+        (62, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期").to_string(), true, col == 1),
+        (64, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型").to_string(), true, col == 2),
+        (66, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小").to_string(), true, col == 3),
+        (75, t!("По возрастанию", "Ascending", ja: "昇順", pt: "Crescente", zh: "递增").to_string(), true, asc),
+        (76, t!("По убыванию", "Descending", ja: "降順", pt: "Decrescente", zh: "递减").to_string(), true, !asc),
+    ];
+    let id = popup_at(h, at, &items);
+    if id == 0 { return; }
+    let id = match id { 75 => 60 + col as u32 * 2, 76 => 61 + col as u32 * 2, x => x };
+    PostMessageW(GetParent(h), WM_UI, id as usize, 0);
+}
+
+unsafe fn view_menu(h: HWND, at: RECT) {
+    let m = CreatePopupMenu();
+    let add = |m: HMENU, id: usize, label: String, enabled: bool, checked: bool| {
+        let flags = MF_STRING | if enabled { 0 } else { MF_GRAYED } | if checked { MF_CHECKED } else { 0 };
+        AppendMenuW(m, flags, id, w(&label).as_ptr());
+    };
+    add(m, 80, t!("Очень крупные значки", "Extra large icons", ja: "特大アイコン", pt: "Ícones extragrandes", zh: "超大图标").into(), false, false);
+    add(m, 81, t!("Крупные значки", "Large icons", ja: "大アイコン", pt: "Ícones grandes", zh: "大图标").into(), true, ST.with_borrow(|s| s.thumbs));
+    add(m, 82, t!("Обычные значки", "Medium icons", ja: "中アイコン", pt: "Ícones médios", zh: "中等图标").into(), false, false);
+    add(m, 83, t!("Мелкие значки", "Small icons", ja: "小アイコン", pt: "Ícones pequenos", zh: "小图标").into(), false, false);
+    add(m, 84, t!("Список", "List", ja: "一覧", pt: "Lista", zh: "列表").into(), false, false);
+    add(m, 85, t!("Таблица", "Details", ja: "詳細", pt: "Detalhes", zh: "详细信息").into(), true, !ST.with_borrow(|s| s.thumbs));
+    add(m, 86, t!("Плитка", "Tiles", ja: "タイル", pt: "Blocos", zh: "平铺").into(), false, false);
+    AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
+    let show = CreatePopupMenu();
+    add(show, 90, t!("Область переходов", "Navigation pane", ja: "ナビゲーション ウィンドウ", pt: "Painel de navegação", zh: "导航窗格").into(), false, true);
+    add(show, 91, t!("Область предпросмотра", "Preview pane", ja: "プレビュー ウィンドウ", pt: "Painel de visualização", zh: "预览窗格").into(), false, false);
+    add(show, 92, t!("Область сведений", "Details pane", ja: "詳細ウィンドウ", pt: "Painel de detalhes", zh: "详细信息窗格").into(), false, false);
+    add(show, 93, t!("Флажки элементов", "Item check boxes", ja: "項目のチェック ボックス", pt: "Caixas de seleção de itens", zh: "项目复选框").into(), true, false);
+    add(show, 94, t!("Расширения имён файлов", "File name extensions", ja: "ファイル名拡張子", pt: "Extensões de nome de arquivo", zh: "文件扩展名").into(), false, false);
+    add(show, 95, t!("Скрытые элементы", "Hidden items", ja: "隠しファイル", pt: "Itens ocultos", zh: "隐藏的项目").into(), true, SHOW_HIDDEN.load(Relaxed));
+    add(show, 96, t!("Компактный вид", "Compact view", ja: "コンパクト表示", pt: "Exibição compacta", zh: "紧凑视图").into(), false, false);
+    AppendMenuW(m, MF_POPUP | MF_STRING, show as usize, w(t!("Показать", "Show", ja: "表示", pt: "Mostrar", zh: "显示")).as_ptr());
+    let group = CreatePopupMenu();
+    add(group, 70, t!("Нет", "(None)", ja: "なし", pt: "(Nenhum)", zh: "(无)").into(), true, !group_on());
+    add(group, 71, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称").into(), false, false);
+    add(group, 72, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期").into(), true, group_on());
+    add(group, 73, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型").into(), false, false);
+    add(group, 74, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小").into(), false, false);
+    AppendMenuW(m, MF_POPUP | MF_STRING, group as usize, w(t!("Группировать", "Group by", ja: "グループ化", pt: "Agrupar por", zh: "分组依据")).as_ptr());
+    let mut pt = POINT { x: at.left, y: at.bottom + sc(2) };
+    ClientToScreen(h, &mut pt);
+    let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, h, ptr::null());
+    DestroyMenu(m);
+    if id != 0 { PostMessageW(GetParent(h), WM_UI, id as usize, 0); }
+}
+
+unsafe fn more_menu(h: HWND, at: RECT) {
+    let sel = selected_count();
+    let items = [
+        (44u32, t!("Выделить все", "Select all", ja: "すべて選択", pt: "Selecionar tudo", zh: "全选").to_string(), true, false),
+        (45, t!("Инвертировать выделение", "Invert selection", ja: "選択を反転", pt: "Inverter seleção", zh: "反向选择").to_string(), true, false),
+        (46, t!("Копировать путь", "Copy path", ja: "パスのコピー", pt: "Copiar caminho", zh: "复制路径").to_string(), true, false),
+        (47, t!("Открыть в новом окне", "Open in new window", ja: "新しいウィンドウで開く", pt: "Abrir em nova janela", zh: "在新窗口中打开").to_string(), true, false),
+        (48, t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性").to_string(), sel > 0, false),
+        (49, t!("Параметры", "Options", ja: "オプション", pt: "Opções", zh: "选项").to_string(), false, false),
+    ];
+    let id = popup_at(h, at, &items);
+    if id != 0 { PostMessageW(GetParent(h), WM_UI, id as usize, 0); }
+}
+
+unsafe fn tab_menu(h: HWND, i: usize, at: RECT) {
+    let m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, 1, w(t!("Дублировать вкладку", "Duplicate tab", ja: "タブを複製", pt: "Duplicar guia", zh: "复制标签页")).as_ptr());
+    AppendMenuW(m, MF_STRING, 2, w(t!("Закрыть вкладку", "Close tab", ja: "タブを閉じる", pt: "Fechar guia", zh: "关闭标签页")).as_ptr());
+    AppendMenuW(m, MF_STRING, 3, w(t!("Закрыть остальные", "Close other tabs", ja: "他のタブを閉じる", pt: "Fechar outras guias", zh: "关闭其他标签页")).as_ptr());
+    AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
+    AppendMenuW(m, MF_STRING, 4, w(t!("Копировать путь", "Copy path", ja: "パスのコピー", pt: "Copiar caminho", zh: "复制路径")).as_ptr());
+    let mut pt = POINT { x: at.left, y: at.bottom };
+    ClientToScreen(h, &mut pt);
+    let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
+    DestroyMenu(m);
+    let main = GetParent(h);
+    match id {
+        1 => { PostMessageW(main, WM_UI, 29, i as isize); }
+        2 => { PostMessageW(main, WM_UI, 2, i as isize); }
+        3 => { PostMessageW(main, WM_UI, 30, i as isize); }
+        4 => { PostMessageW(main, WM_UI, 31, i as isize); }
+        _ => {}
+    }
+}
+
+/// Reorders the tabs and keeps the same tab active.
+fn reorder_tab(from: usize, to: usize) {
+    ST.with_borrow_mut(|st| {
+        if from >= st.tabs.len() { return; }
+        let old_active = st.active;
+        let at = if to > from { to - 1 } else { to }.min(st.tabs.len() - 1);
+        let p = st.tabs.remove(from);
+        st.tabs.insert(at, p);
+        let mut a = old_active;
+        if from < a { a -= 1; }
+        if at <= a { a += 1; }
+        st.active = if from == old_active { at } else { a.min(st.tabs.len() - 1) };
+    });
+    if let Some(h) = ST.with_borrow(|st| (st.tab != 0 as HWND).then_some(st.tab)) { unsafe { InvalidateRect(h, ptr::null(), 0) }; }
+}
+
+unsafe fn history_menu(h: HWND, at: RECT, back: bool) {
+    let (v, pos) = ST.with_borrow(|st| (st.hist.v.clone(), st.hist.pos));
+    let mut items = vec![];
+    if back { for i in (0..pos).rev() { items.push((i as u32 + 1, v[i].to_string_lossy().into_owned(), true, false)); } }
+    else { for i in pos + 1..v.len() { items.push((i as u32 + 1, v[i].to_string_lossy().into_owned(), true, false)); } }
+    if items.is_empty() { return; }
+    let id = popup_at(h, at, &items);
+    if id > 0 { PostMessageW(GetParent(h), WM_UI, 23, (id - 1) as isize); }
+}
+
 pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
     let layout_now = || {
@@ -698,6 +1030,14 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         WM_SIZE => { place_edit(h); InvalidateRect(h, ptr::null(), 0); } // the pill and the tabs re-flow: repaint it all
         WM_TIMER if wp == 4 => { InvalidateRect(h, ptr::null(), 0); }
         WM_MOUSEMOVE => {
+            if let Some((_, x0)) = TAB_DRAG.get() {
+                if (x - x0).abs() > sc(6) { TAB_MOVED.set(true); }
+                if TAB_MOVED.get() {
+                    let l = layout_now();
+                    let to = l.tabs.iter().position(|t| x < (t.left + t.right) / 2).unwrap_or(l.tabs.len());
+                    if TAB_DROP.replace(to) != to { InvalidateRect(h, ptr::null(), 0); }
+                }
+            }
             let k = match hit(&layout_now(), x, y) { NONE => crumb_at(x, y).map_or(NONE, |i| CRUMB + i as i32), k => k };
             let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
             TrackMouseEvent(&mut tme);
@@ -723,20 +1063,86 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 InvalidateRect(h, ptr::null(), 0);
                 return 0;
             }
+            match k {
+                NEW | NEW_MORE | PASTE_MORE | SORT | VIEW | MORE => { PENDING_MENU.set(k); PRESS.set((k, now())); InvalidateRect(h, ptr::null(), 0); return 0; }
+                SEARCH_BOX => {
+                    let search = ST.with(|c| c.try_borrow().map_or(ptr::null_mut(), |s| s.search));
+                    SetFocus(search);
+                    let n = GetWindowTextLengthW(search);
+                    SendMessageW(search, EM_SETSEL, n as usize, n as isize);
+                    return 0;
+                }
+                SEARCH_CLEAR => {
+                    let search = ST.with(|c| c.try_borrow().map_or(ptr::null_mut(), |s| s.search));
+                    if GetWindowTextLengthW(search) == 0 {
+                        SetFocus(search);
+                    } else {
+                        PostMessageW(GetParent(h), super::WM_SEARCH, 27, 0);
+                    }
+                    return 0;
+                }
+                _ => {}
+            }
+            if (TAB..CLOSE).contains(&k) {
+                let i = (k - TAB) as usize;
+                TAB_DRAG.set(Some((i, x)));
+                TAB_DROP.set(i);
+                TAB_MOVED.set(false);
+                SetCapture(h);
+            }
             PRESS.set((k, now()));
             InvalidateRect(h, ptr::null(), 0);
             let (act, idx) = match k {
-                k if (CMD..CMD + CMD_GLYPHS.len() as i32).contains(&k) => (CMD_ACTIONS[(k - CMD) as usize], 0), BACK => (4, 0), FWD => (5, 0), UP => (6, 0), RELOAD => (7, 0), SEARCH => (9, 0), VIEW => (8, 0), PLUS => (3, 0),
+                CUT => (10, 0), COPY => (11, 0), PASTE => (12, 0), RENAME => (13, 0), DELETE => (14, 0), SHARE => (50, 0),
+                BACK => (4, 0), FWD => (5, 0), UP => (6, 0), RELOAD => (7, 0), PLUS => (3, 0),
                 k if k >= CLOSE => (2, (k - CLOSE) as isize),
                 k => (if m == WM_MBUTTONDOWN { 2 } else { 1 }, (k - TAB) as isize), // middle click on a tab closes it
             };
             PostMessageW(GetParent(h), WM_UI, act, idx);
         }
-        WM_COMMAND if (wp >> 16) == 0x0100 || (wp >> 16) == 0x0200 => {
-            // edit got / lost focus: shown only while typing (the path parts otherwise), outline colour
-            ShowWindow(lp as HWND, if (wp >> 16) == 0x0100 { SW_SHOW } else { SW_HIDE });
+        WM_LBUTTONUP => {
+            if let Some((from, _)) = TAB_DRAG.take() {
+                ReleaseCapture();
+                let moved = TAB_MOVED.replace(false);
+                let to = TAB_DROP.replace(0);
+                if moved && to != from && to != from + 1 { reorder_tab(from, to); }
+                InvalidateRect(h, ptr::null(), 0);
+                return 0;
+            }
+            let k = PENDING_MENU.replace(NONE);
+            if k != NONE {
+                let l = layout_now();
+                if hit(&l, x, y) == k {
+                    match k {
+                        NEW | NEW_MORE => new_menu(h, rc(l.new.left, l.new.top, l.new_more.right, l.new.bottom)),
+                        PASTE_MORE => paste_menu(h, l.paste_more),
+                        SORT => sort_menu(h, l.sort),
+                        VIEW => view_menu(h, l.view),
+                        MORE => more_menu(h, l.more),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        WM_RBUTTONUP => {
+            let l = layout_now();
+            if inside(&l.back, x, y) { history_menu(h, l.back, true); return 0; }
+            if inside(&l.fwd, x, y) { history_menu(h, l.fwd, false); return 0; }
+            if let Some(i) = l.tabs.iter().position(|t| inside(t, x, y)) {
+                let main = GetParent(h);
+                crate::tab_select(main, i);
+                tab_menu(h, i, l.tabs[i]);
+            }
+        }
+        WM_COMMAND if matches!((wp >> 16) as u32, 0x0100 | 0x0200) => {
+            // the address box is shown only while typing (the path parts otherwise); the search box stays visible
+            let edit = ST.with(|c| c.try_borrow().map_or(ptr::null_mut(), |s| s.edit));
+            if lp as HWND == edit {
+                ShowWindow(edit, if (wp >> 16) == 0x0100 { SW_SHOW } else { SW_HIDE });
+            }
             InvalidateRect(h, ptr::null(), 0);
         }
+        WM_COMMAND if (wp >> 16) as u32 == 0x0300 => { InvalidateRect(h, ptr::null(), 0); } // search text changed: the clear button
         WM_CTLCOLOREDIT => {
             // the address box: white text on the pill's colour
             let dc = wp as HDC;
@@ -885,7 +1291,6 @@ unsafe fn paint_nav(hwnd: HWND) {
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
-    winrust_common::style::backdrop(dc, cr, sc(100) as f32 / 100.0);
     SetBkMode(dc, TRANSPARENT as i32);
     let (f_txt, f_head, f_glyph, f_small) = (font(13, 400, ui_face()) as HFONT, font(12, 600, ui_face()) as HFONT, font(16, 400, winrust_common::style::icon_face()) as HFONT, font(11, 400, ui_face()) as HFONT);
     let of = SelectObject(dc, f_txt);
