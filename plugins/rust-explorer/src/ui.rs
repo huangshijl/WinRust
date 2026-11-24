@@ -100,6 +100,7 @@ fn crumb_at(x: i32, y: i32) -> Option<usize> { CRUMBS.with_borrow(|c| c.iter().p
 
 /// Path parts with the folder each one opens: C:\Users\me -> [("C:", C:\), ("Users", C:\Users), ("me", C:\Users\me)].
 fn crumbs_of(dir: &Path) -> Vec<(String, PathBuf)> {
+    if dir.to_string_lossy().starts_with("::") { return vec![(crate::label(&dir.to_path_buf()), dir.to_path_buf())]; }
     let mut acc = PathBuf::new();
     dir.components().filter_map(|c| {
         acc.push(c.as_os_str());
@@ -293,7 +294,13 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
                 let of = SelectObject(dc, f_big);
                 text(dc, "\u{E8B7}", rc(0, mid - sc(40), cr.right, mid + sc(10)), mix(listbg(), pal().dim, 0.5), DT_CENTER);
                 SelectObject(dc, f_txt);
-                let msg = if SEARCHING.with_borrow(|s| s.is_some()) { t!("Ничего не найдено", "Nothing found", ja: "何も見つかりません", pt: "Nada encontrado", zh: "未找到任何内容") } else { t!("Эта папка пуста", "This folder is empty", ja: "このフォルダーは空です", pt: "Esta pasta está vazia", zh: "此文件夹为空") };
+                let msg = if crate::cur_dir().to_string_lossy() == "::recycle" {
+                    t!("Корзина пуста", "Recycle Bin is empty", ja: "ごみ箱は空です", pt: "A Lixeira está vazia", zh: "回收站为空")
+                } else if SEARCHING.with_borrow(|s| s.is_some()) {
+                    t!("Ничего не найдено", "Nothing found", ja: "何も見つかりません", pt: "Nada encontrado", zh: "未找到任何内容")
+                } else {
+                    t!("Эта папка пуста", "This folder is empty", ja: "このフォルダーは空です", pt: "Esta pasta está vazia", zh: "此文件夹为空")
+                };
                 text(dc, msg, rc(0, mid + sc(14), cr.right, mid + sc(40)), pal().dim, DT_CENTER);
                 SelectObject(dc, of);
                 DeleteObject(f_big);
@@ -307,10 +314,11 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
                 let mut st = c.try_borrow_mut().ok()?;
                 let State { dir, rows, .. } = &mut *st;
                 let r = rows.get_mut(i)?;
-                if r.icon < 0 && !r.hdr { r.icon = icon_of(&dir.join(&r.name), r.dir); }
-                Some((r.name.clone(), r.dir, r.time, r.size, r.icon, r.hdr))
+                let actual = r.origin.clone().or_else(|| r.target.clone()).unwrap_or_else(|| dir.join(&r.name));
+                if r.icon < 0 && !r.hdr { r.icon = icon_of(&actual, r.dir); }
+                Some((r.name.clone(), r.target.is_some(), r.kind.clone(), r.dir, r.time, r.size, r.icon, r.hdr))
             });
-            let Some((name, is_dir, time, size, icon, hdr)) = row else { return CDRF_DODEFAULT as isize };
+            let Some((name, virtual_row, row_kind, is_dir, time, size, icon, hdr)) = row else { return CDRF_DODEFAULT as isize };
             let mut r = RECT { left: LVIR_BOUNDS as i32, ..std::mem::zeroed() };
             SendMessageW(list, LVM_GETITEMRECT, i, &mut r as *mut _ as isize);
             let row_r = rc(0, r.top, cr.right, r.bottom);
@@ -356,16 +364,16 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             SetBkMode(dc, TRANSPARENT as i32);
             let of = SelectObject(dc, f_name as HFONT);
             let p = Path::new(&name);
-            let hit_of_search = p.is_absolute(); // search hits are absolute paths: the name column shows just the file name
-            let shown = if hit_of_search { p.file_name().map_or(name.clone(), |n| n.to_string_lossy().into_owned()) } else { crate::shown_name(&name, false, is_dir) };
+            let hit_of_search = !virtual_row && p.is_absolute(); // search hits are absolute paths: the name column shows just the file name
+            let shown = if virtual_row { name.clone() } else if hit_of_search { p.file_name().map_or(name.clone(), |n| n.to_string_lossy().into_owned()) } else { crate::shown_name(&name, false, is_dir) };
             let shown = if hit_of_search { crate::shown_name(&shown, false, is_dir) } else { shown };
             text(dc, &shown, rc(x[0] + sc(16) + iw + sc(12), r.top, x[1] - sc(8), r.bottom), pal().text, DT_LEFT);
             SelectObject(dc, f_det as HFONT);
             let dim = if sel { mix(pal().dim, pal().text, 0.45) } else { pal().dim };
             text(dc, &date_text(time), rc(x[1] + sc(10), r.top, x[2] - sc(8), r.bottom), dim, DT_LEFT);
-            let kind = type_text(&name, is_dir);
+            let kind = row_kind.unwrap_or_else(|| type_text(&name, is_dir));
             text(dc, &kind, rc(x[2] + sc(10), r.top, x[3] - sc(8), r.bottom), dim, DT_LEFT | DT_PATH_ELLIPSIS);
-            if !is_dir { text(dc, &size_text(size), rc(x[3], r.top, x[3] + cw[3] - sc(14), r.bottom), dim, DT_RIGHT); }
+            if !is_dir || size > 0 { text(dc, &size_text(size), rc(x[3], r.top, x[3] + cw[3] - sc(14), r.bottom), dim, DT_RIGHT); }
             SelectObject(dc, of);
             CDRF_SKIPDEFAULT as isize
         }
@@ -670,8 +678,8 @@ unsafe fn paint_chrome(hwnd: HWND) {
     let mut cr: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut cr);
     // everything painting needs from the window state, copied out so nothing is borrowed while drawing
-    let snap = ST.with(|c| c.try_borrow().ok().map(|s| (s.tabs.iter().map(label).collect::<Vec<_>>(), s.active, s.hist.pos > 0, s.hist.pos + 1 < s.hist.v.len(), s.edit, s.search, s.dir.clone())));
-    let Some((tab_labels, active, can_back, can_fwd, edit, search, dir)) = snap else { EndPaint(hwnd, &ps); return };
+    let snap = ST.with(|c| c.try_borrow().ok().map(|s| (s.tabs.iter().map(label).collect::<Vec<_>>(), s.active, s.hist.pos > 0, s.hist.pos + 1 < s.hist.v.len(), s.edit, s.search, s.dir.clone(), s.dir.to_string_lossy().starts_with("::"))));
+    let Some((tab_labels, active, can_back, can_fwd, edit, search, dir, virt)) = snap else { EndPaint(hwnd, &ps); return };
     BUSY.set(false);
     let (dc, bmp) = (CreateCompatibleDC(wdc), CreateCompatibleBitmap(wdc, cr.right, cr.bottom));
     let old = SelectObject(dc, bmp);
@@ -775,7 +783,7 @@ unsafe fn paint_chrome(hwnd: HWND) {
     }
 
     // command bar: New, cut / copy / paste / rename / delete / share, then sort / view / more
-    let (cut_on, copy_on, paste_on, rename_on, delete_on, share_on, new_on) = (sel > 0 && !zip, sel > 0, !zip, sel == 1 && !zip, sel > 0 && !zip, false, !zip);
+    let (cut_on, copy_on, paste_on, rename_on, delete_on, share_on, new_on) = (sel > 0 && !zip && !virt, sel > 0 && !virt, !zip && !virt, sel == 1 && !zip && !virt, sel > 0 && !zip && !virt, false, !zip && !virt);
     let [c_new, c_cut, c_copy, c_paste, c_rename, c_delete, c_share, c_sort, c_view] = [
         t!("Создать", "New", ja: "新規作成", pt: "Novo", zh: "新建"),
         t!("Вырезать", "Cut", ja: "切り取り", pt: "Recortar", zh: "剪切"),
@@ -1193,7 +1201,7 @@ enum NavKind { Section, Home, Folder, Drive, Recycle, ThisPC }
 struct NavItem { title: String, path: PathBuf, glyph: &'static str, cap: Option<(u64, u64)>, depth: i32, kind: NavKind, expandable: bool, expanded: bool }
 
 fn nav_h(it: &NavItem) -> i32 {
-    sc(if it.kind == NavKind::Section { NAV_HEAD } else if it.cap.is_some() { NAV_DRIVE } else { NAV_ROW })
+    sc(if matches!(it.kind, NavKind::Section | NavKind::ThisPC) { NAV_HEAD } else if it.cap.is_some() { NAV_DRIVE } else { NAV_ROW })
 }
 
 thread_local! {
@@ -1282,33 +1290,11 @@ pub fn toggle_pin(p: &Path) {
     if !h.is_null() { nav_init(h); nav_dirty(); }
 }
 
-pub fn nav_init(h: HWND) {
-    NAVWND.set(h as isize);
-    if let Some(f) = nav_width_file() {
-        if let Ok(s) = fs::read_to_string(f) { if let Ok(w) = s.trim().parse::<i32>() { NAV_WIDTH.set(w.clamp(180, 520)); } }
-    }
-    let home = PathBuf::from(env::var_os("USERPROFILE").unwrap_or_default());
-    let section = |lbl: &str| NavItem { title: lbl.into(), path: PathBuf::new(), glyph: "", cap: None, depth: 0, kind: NavKind::Section, expandable: false, expanded: false };
-    let node = |title: String, path: PathBuf, glyph: &'static str, kind: NavKind, expandable: bool| NavItem { title, path, glyph, cap: None, depth: 1, kind, expandable, expanded: false };
-    let mut v = vec![section(t!("Быстрый доступ", "Quick access", ja: "クイック アクセス", pt: "Acesso rápido", zh: "快速访问"))];
-    v.push(node(t!("Главная", "Home", ja: "ホーム", pt: "Início", zh: "主页").into(), home.clone(), "\u{E80F}", NavKind::Home, false));
-    use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos};
-    let known = [
-        (t!("Рабочий стол", "Desktop", ja: "デスクトップ", pt: "Área de Trabalho", zh: "桌面"), &FOLDERID_Desktop, "\u{E7F4}"),
-        (t!("Загрузки", "Downloads", ja: "ダウンロード", pt: "Downloads", zh: "下载"), &FOLDERID_Downloads, "\u{E896}"),
-        (t!("Документы", "Documents", ja: "ドキュメント", pt: "Documentos", zh: "文档"), &FOLDERID_Documents, "\u{E8A5}"),
-        (t!("Изображения", "Pictures", ja: "ピクチャ", pt: "Imagens", zh: "图片"), &FOLDERID_Pictures, "\u{E91B}"),
-        (t!("Музыка", "Music", ja: "ミュージック", pt: "Música", zh: "音乐"), &FOLDERID_Music, "\u{E8D6}"),
-        (t!("Видео", "Videos", ja: "ビデオ", pt: "Vídeos", zh: "视频"), &FOLDERID_Videos, "\u{E714}"),
-    ];
-    for (lbl, id, g) in known {
-        let Some(p) = crate::sh::known_dir(id).filter(|p| p.is_dir()) else { continue };
-        v.push(node(lbl.into(), p, g, NavKind::Folder, true));
-    }
-    for p in pins() {
-        if p.is_dir() { v.push(node(p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned()), p, "\u{E718}", NavKind::Folder, true)); }
-    }
-    v.push(section(t!("Этот компьютер", "This PC", ja: "PC", pt: "Este Computador", zh: "此电脑")));
+pub struct DriveInfo { pub title: String, pub root: PathBuf, pub cap: Option<(u64, u64)>, pub network: bool }
+
+/// Fixed, removable and mapped network drives, with the volume label and free / total bytes.
+pub fn drive_list() -> Vec<DriveInfo> {
+    let mut out = vec![];
     unsafe {
         use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
         let mask = GetLogicalDrives();
@@ -1319,10 +1305,7 @@ pub fn nav_init(h: HWND) {
             // fixed and removable disks only: asking a dead network share for its label would stall the window
             let ty = GetDriveTypeW(w(&root).as_ptr());
             if ty == 4 {
-                // a mapped network drive: listed without label and size, they would stall the window while a share is down
-                let mut it = node(tf!("Сетевой диск ({}:)", "Network Drive ({}:)", ja: "ネットワーク ドライブ ({}:)", pt: "Unidade de rede ({}:)", zh: "网络驱动器（{}:）", letter), PathBuf::from(root), "\u{E8CE}", NavKind::Drive, true);
-                it.cap = None;
-                v.push(it);
+                out.push(DriveInfo { title: tf!("Сетевой диск ({}:)", "Network Drive ({}:)", ja: "ネットワーク ドライブ ({}:)", pt: "Unidade de rede ({}:)", zh: "网络驱动器（{}:）", letter), root: PathBuf::from(root), cap: None, network: true });
                 continue;
             }
             if !matches!(ty, 2 | 3) { continue; }
@@ -1332,11 +1315,50 @@ pub fn nav_init(h: HWND) {
             let (mut free, mut total) = (0u64, 0u64);
             let cap = (GetDiskFreeSpaceExW(w(&root).as_ptr(), &mut free, &mut total, ptr::null_mut()) != 0 && total > 0).then_some((free, total));
             let base = if name.is_empty() { t!("Локальный диск", "Local Disk", ja: "ローカル ディスク", pt: "Disco local", zh: "本地磁盘") } else { &name };
-            let mut it = node(format!("{base} ({letter}:)"), PathBuf::from(root), "\u{EDA2}", NavKind::Drive, true);
-            it.cap = cap;
-            v.push(it);
+            out.push(DriveInfo { title: format!("{base} ({letter}:)"), root: PathBuf::from(root), cap, network: false });
         }
     }
+    out
+}
+
+/// Quick access folders: the known user folders that exist, then the pinned ones.
+pub fn quick_folders() -> Vec<(String, PathBuf, &'static str)> {
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos};
+    let known = [
+        (t!("Рабочий стол", "Desktop", ja: "デスクトップ", pt: "Área de Trabalho", zh: "桌面"), &FOLDERID_Desktop, "\u{E7F4}"),
+        (t!("Загрузки", "Downloads", ja: "ダウンロード", pt: "Downloads", zh: "下载"), &FOLDERID_Downloads, "\u{E896}"),
+        (t!("Документы", "Documents", ja: "ドキュメント", pt: "Documentos", zh: "文档"), &FOLDERID_Documents, "\u{E8A5}"),
+        (t!("Изображения", "Pictures", ja: "ピクチャ", pt: "Imagens", zh: "图片"), &FOLDERID_Pictures, "\u{E91B}"),
+        (t!("Музыка", "Music", ja: "ミュージック", pt: "Música", zh: "音乐"), &FOLDERID_Music, "\u{E8D6}"),
+        (t!("Видео", "Videos", ja: "ビデオ", pt: "Vídeos", zh: "视频"), &FOLDERID_Videos, "\u{E714}"),
+    ];
+    let mut out: Vec<(String, PathBuf, &'static str)> = known.into_iter().filter_map(|(lbl, id, g)| crate::sh::known_dir(id).filter(|p| p.is_dir()).map(|p| (lbl.to_string(), p, g))).collect();
+    for p in pins() {
+        if p.is_dir() { out.push((p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned()), p, "\u{E718}")); }
+    }
+    out
+}
+
+pub fn nav_init(h: HWND) {
+    NAVWND.set(h as isize);
+    if let Some(f) = nav_width_file() {
+        if let Ok(s) = fs::read_to_string(f) { if let Ok(w) = s.trim().parse::<i32>() { NAV_WIDTH.set(w.clamp(180, 520)); } }
+    }
+    let section = |lbl: &str| NavItem { title: lbl.into(), path: PathBuf::new(), glyph: "", cap: None, depth: 0, kind: NavKind::Section, expandable: false, expanded: false };
+    let node = |title: String, path: PathBuf, glyph: &'static str, kind: NavKind, expandable: bool| NavItem { title, path, glyph, cap: None, depth: 1, kind, expandable, expanded: false };
+    let mut v = vec![section(t!("Быстрый доступ", "Quick access", ja: "クイック アクセス", pt: "Acesso rápido", zh: "快速访问"))];
+    v.push(node(t!("Главная", "Home", ja: "ホーム", pt: "Início", zh: "主页").into(), PathBuf::from("::home"), "\u{E80F}", NavKind::Home, false));
+    for (lbl, p, g) in quick_folders() { v.push(node(lbl, p, g, NavKind::Folder, true)); }
+    let mut thispc = section(t!("Этот компьютер", "This PC", ja: "PC", pt: "Este Computador", zh: "此电脑"));
+    thispc.path = PathBuf::from("::thispc");
+    thispc.kind = NavKind::ThisPC;
+    v.push(thispc);
+    for d in drive_list() {
+        let mut it = node(d.title, d.root, if d.network { "\u{E8CE}" } else { "\u{EDA2}" }, NavKind::Drive, true);
+        it.cap = d.cap;
+        v.push(it);
+    }
+    v.push(node(t!("Корзина", "Recycle Bin", ja: "ごみ箱", pt: "Lixeira", zh: "回收站").into(), PathBuf::from("::recycle"), "\u{E74D}", NavKind::Recycle, false));
     // expand the folders that were open before (the current folder's chain is opened again by nav_sync)
     let mut i = 0;
     while i < v.len() {
@@ -1478,9 +1500,10 @@ unsafe fn paint_nav(hwnd: HWND) {
             let hgt = nav_h(it);
             if y + hgt < 0 { y += hgt; continue; }
             if y > cr.bottom { break; }
-            if it.kind == NavKind::Section {
+            if it.kind == NavKind::Section || it.kind == NavKind::ThisPC {
                 SelectObject(dc, f_head);
-                text(dc, &it.title, rc(sc(16), y + sc(4), cr.right - sc(8), y + hgt), pal().dim, DT_LEFT);
+                let on = it.kind == NavKind::ThisPC && here == Some(i);
+                text(dc, &it.title, rc(sc(16), y + sc(4), cr.right - sc(8), y + hgt), if on { pal().text } else { pal().dim }, DT_LEFT);
                 y += hgt;
                 continue;
             }

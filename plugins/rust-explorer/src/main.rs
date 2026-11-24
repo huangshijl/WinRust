@@ -163,7 +163,7 @@ static SEARCH_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsi
 static LABEL_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0); // the rename box (only one exists at a time)
 
 #[derive(Clone)]
-struct Row { name: String, dir: bool, size: u64, time: u64, icon: i32, thumb: i32, hdr: bool } // time: FILETIME ticks; thumb: -2 not asked, -1 asked, >=0 image-list index
+struct Row { name: String, origin: Option<PathBuf>, target: Option<PathBuf>, kind: Option<String>, dir: bool, size: u64, time: u64, icon: i32, thumb: i32, hdr: bool } // origin: where a recycle item came from; target: real path of a virtual page row; kind: the Type column there
 
 /// Explorer's view modes. Details and the icon sizes; Tiles shows 48 px pictures with type and size.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -209,7 +209,7 @@ const WM_REFRESH: u32 = WM_APP + 8; // the folder changed on disk (watch thread)
 static WATCH_GEN: AtomicU32 = AtomicU32::new(0); // bumped on every load: older watch threads exit
 
 fn row(name: String, m: Option<&fs::Metadata>) -> Row {
-    Row { name, dir: m.is_some_and(|m| m.is_dir()), size: m.map_or(0, |m| m.len()), time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2, hdr: false }
+    Row { name, origin: None, target: None, kind: None, dir: m.is_some_and(|m| m.is_dir()), size: m.map_or(0, |m| m.len()), time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2, hdr: false }
 }
 
 /// Folders first when ungrouped; grouped by date / name / type / size, then by the chosen column.
@@ -323,7 +323,7 @@ fn add_headers(rows: &mut Vec<Row>) {
         let (_, label) = group_key(&r);
         if label != last {
             last = label.clone();
-            out.push(Row { name: format!("?{label}"), dir: false, size: 0, time: 0, icon: -1, thumb: -1, hdr: true });
+            out.push(Row { name: format!("?{label}"), origin: None, target: None, kind: None, dir: false, size: 0, time: 0, icon: -1, thumb: -1, hdr: true });
         }
         out.push(r);
     }
@@ -411,6 +411,9 @@ fn properties(path: &PathBuf) {
 
 /// New folder / new empty file with a free name ("New folder", "New folder (2)", ...).
 fn new_entry(dir: &PathBuf, base: &str, folder: bool) -> Result<PathBuf, String> {
+    if is_virtual(dir) {
+        return Err(t!("Действие недоступно на этой странице", "Not available on this page", ja: "このページでは使用できません", pt: "Indisponível nesta página", zh: "此页面不支持该操作").into());
+    }
     if zipx::split_zip(dir).is_some() {
         return Err(t!("Архив открыт только для чтения", "An archive is read-only", ja: "アーカイブは読み取り専用です", pt: "Um arquivo é somente leitura", zh: "压缩包在这里是只读的").into());
     }
@@ -452,7 +455,7 @@ fn select_edit(name: &str) {
 /// Copies and moves to another drive run in our own copier (jobs.rs: parallel on SSDs, unbuffered for big files); moves on the
 /// same drive (a rename), shell items, and folders that need elevation go through the shell.
 fn paste(h: HWND, dir: &PathBuf) {
-    if zipx::split_zip(dir).is_some() { return; } // an archive is read-only here
+    if is_virtual(dir) || zipx::split_zip(dir).is_some() { return; }
     let Some((paths, cut)) = sh::clip_get() else { return };
     let fast = jobs::can_fast_copy(&paths, dir) && !(cut && paths.iter().all(|p| jobs::same_volume(p, dir))) && jobs::writable(dir);
     if fast && !jobs::busy() {
@@ -570,6 +573,7 @@ fn zip_menu(h: HWND, paths: &[PathBuf]) {
 /// The shell menu for the selection, with our "Compress to ZIP" / "Extract here" on top.
 fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
     if zipx::split_zip(dir).is_some() { return zip_menu(h, paths); }
+    if cur_virtual() { let _ = sh::show(h, paths, &[]); reload(h); return; } // drives and quick access folders get their own shell menu
     let mut extra = vec![(MENU_ZIP, t!("Сжать в ZIP", "Compress to ZIP", ja: "ZIP に圧縮", pt: "Compactar em ZIP", zh: "压缩为 ZIP"))];
     if paths.iter().all(|p| p.is_file() && jobs::is_archive(p)) {
         extra.insert(0, (MENU_EXTRACT, t!("Извлечь сюда", "Extract here", ja: "ここに展開", pt: "Extrair aqui", zh: "解压到此处")));
@@ -622,6 +626,20 @@ fn set_icons_hidden(hide: bool) {
 /// Right click on empty space: the folder's own menu.
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bg_menu(h: HWND) {
+    if !desk() && cur_virtual() {
+        let m = CreatePopupMenu();
+        AppendMenuW(m, MF_STRING, 1, w(t!("Обновить", "Refresh", ja: "最新の情報に更新", pt: "Atualizar", zh: "刷新")).as_ptr());
+        if cur_dir().to_string_lossy() == "::recycle" {
+            AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
+            AppendMenuW(m, MF_STRING, 2, w(t!("Очистить корзину", "Empty Recycle Bin", ja: "ごみ箱を空にする", pt: "Esvaziar Lixeira", zh: "清空回收站")).as_ptr());
+        }
+        let mut pt: POINT = std::mem::zeroed();
+        GetCursorPos(&mut pt);
+        let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
+        DestroyMenu(m);
+        match id { 1 => reload(h), 2 => recycle_empty(h), _ => {} }
+        return;
+    }
     let m = CreatePopupMenu();
     let items = [
         (1usize, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹")),
@@ -793,22 +811,194 @@ fn hide_extensions() -> bool {
 }
 
 fn label(dir: &PathBuf) -> String {
+    if let Some(p) = page_name(dir) { return p.to_string(); }
     dir.file_name().map_or_else(|| dir.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
 }
 
+/// The virtual pages the navigation pane can open ("::home", "::thispc").
+pub(crate) fn page_name(dir: &Path) -> Option<&'static str> {
+    match dir.to_string_lossy().as_ref() {
+        "::home" => Some(t!("Главная", "Home", ja: "ホーム", pt: "Início", zh: "主页")),
+        "::thispc" => Some(t!("Этот компьютер", "This PC", ja: "PC", pt: "Este Computador", zh: "此电脑")),
+        "::recycle" => Some(t!("Корзина", "Recycle Bin", ja: "ごみ箱", pt: "Lixeira", zh: "回收站")),
+        _ => None,
+    }
+}
+
+fn is_virtual(dir: &Path) -> bool { dir.to_string_lossy().starts_with("::") }
+fn cur_virtual() -> bool { is_virtual(&cur_dir()) }
+
 /// "winrust - File Explorer", like the window title in Windows 11.
 fn window_title(dir: &PathBuf) -> String {
-    let name = if dir.file_name().is_some() { label(dir) } else { dir.to_string_lossy().trim_end_matches(['\\', '/']).to_string() };
+    let name = if let Some(p) = page_name(dir) { p.to_string() } else if dir.file_name().is_some() { label(dir) } else { dir.to_string_lossy().trim_end_matches(['\\', '/']).to_string() };
     let app = t!("Проводник", "File Explorer", ja: "エクスプローラー", pt: "Explorador de Arquivos", zh: "文件资源管理器");
     format!("{name} - {app}")
 }
 
-/// Rows of `dir`, folders first. Desktop mode merges the public desktop (absolute names) and hides hidden files.
-/// None = `dir` itself is unreadable.
+/// One deleted item from a `$I` record: original path, deletion time and the `$R` data next to it.
+fn parse_recycle(meta: &Path, b: &[u8]) -> Option<Row> {
+    if b.len() < 28 { return None; }
+    if u64::from_le_bytes(b[0..8].try_into().ok()?) != 2 { return None; }
+    let size = u64::from_le_bytes(b[8..16].try_into().ok()?);
+    let time = u64::from_le_bytes(b[16..24].try_into().ok()?);
+    let chars = u32::from_le_bytes(b[24..28].try_into().ok()?) as usize;
+    if chars == 0 || b.len() < 28 + chars * 2 { return None; }
+    let path: Vec<u16> = (0..chars).map(|i| u16::from_le_bytes([b[28 + i * 2], b[29 + i * 2]])).collect();
+    let original = PathBuf::from(String::from_utf16_lossy(&path).trim_end_matches('\0'));
+    if original.as_os_str().is_empty() { return None; }
+    let meta_name = meta.file_name()?.to_string_lossy();
+    if meta_name.len() < 3 { return None; }
+    let target = meta.with_file_name(format!("$R{}", &meta_name[2..]));
+    let m = fs::metadata(&target).ok()?;
+    let name = original.file_name().map_or_else(|| target.file_name().map_or_else(|| target.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned()), |n| n.to_string_lossy().into_owned());
+    let kind = original.parent().map_or_else(|| String::new(), |p| p.to_string_lossy().into_owned());
+    Some(Row { name, origin: Some(original), target: Some(target), kind: Some(kind), dir: m.is_dir(), size, time, icon: -1, thumb: -2, hdr: false })
+}
+
+/// The items of this user's Recycle Bin on every fixed / removable drive, newest first.
+fn recycle_rows() -> Vec<Row> {
+    let mut out = vec![];
+    for d in ui::drive_list() {
+        if d.network { continue; }
+        let Ok(sids) = fs::read_dir(d.root.join("$Recycle.Bin")) else { continue };
+        for sid in sids.flatten() {
+            if !sid.path().is_dir() { continue; }
+            let Ok(items) = fs::read_dir(sid.path()) else { continue };
+            for e in items.flatten() {
+                let p = e.path();
+                if !e.file_name().to_string_lossy().to_lowercase().starts_with("$i") { continue; }
+                if let Ok(bytes) = fs::read(&p) { if let Some(r) = parse_recycle(&p, &bytes) { out.push(r); } }
+            }
+        }
+    }
+    out.sort_by(|a, b| b.time.cmp(&a.time));
+    out
+}
+
+/// Rows of the virtual pages: the drives of This PC, the quick access folders of Home and the Recycle Bin.
+fn virtual_rows(dir: &Path) -> Option<Vec<Row>> {
+    let head = |label: &str| Row { name: format!("?{label}"), origin: None, target: None, kind: None, dir: false, size: 0, time: 0, icon: -1, thumb: -1, hdr: true };
+    match dir.to_string_lossy().as_ref() {
+        "::thispc" => {
+            let mut drives: Vec<Row> = ui::drive_list().into_iter().map(|d| {
+                let kind = if d.network { t!("Сетевой диск", "Network Drive", ja: "ネットワーク ドライブ", pt: "Unidade de rede", zh: "网络驱动器") } else { t!("Локальный диск", "Local Disk", ja: "ローカル ディスク", pt: "Disco local", zh: "本地磁盘") };
+                Row { name: d.title, origin: None, target: Some(d.root), kind: Some(kind.into()), dir: true, size: d.cap.map_or(0, |(_, total)| total), time: 0, icon: -1, thumb: -2, hdr: false }
+            }).collect();
+            drives.sort_by_key(|r| r.name.to_lowercase());
+            let mut rows = vec![head(t!("Устройства и диски", "Devices and drives", ja: "デバイスとドライブ", pt: "Dispositivos e unidades", zh: "设备和驱动器"))];
+            rows.extend(drives);
+            Some(rows)
+        }
+        "::home" => {
+            let mut folders: Vec<Row> = ui::quick_folders().into_iter().map(|(title, p, _)| {
+                let m = fs::metadata(&p).ok();
+                Row { name: title, origin: None, target: Some(p), kind: None, dir: true, size: 0, time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2, hdr: false }
+            }).collect();
+            folders.sort_by_key(|r| r.name.to_lowercase());
+            let mut rows = vec![head(t!("Быстрый доступ", "Quick access", ja: "クイック アクセス", pt: "Acesso rápido", zh: "快速访问"))];
+            rows.extend(folders);
+            Some(rows)
+        }
+        "::recycle" => {
+            let items = recycle_rows();
+            if items.is_empty() { return Some(vec![]); }
+            let mut rows = vec![head(t!("Корзина", "Recycle Bin", ja: "ごみ箱", pt: "Lixeira", zh: "回收站"))];
+            rows.extend(items);
+            Some(rows)
+        }
+        _ => None,
+    }
+}
+
+/// The `$I` record next to a `$R` item.
+fn recycle_meta(target: &Path) -> Option<PathBuf> {
+    let n = target.file_name()?.to_string_lossy();
+    n.starts_with("$R").then(|| target.with_file_name(format!("$I{}", &n[2..])))
+}
+
+/// Selected Recycle Bin rows as ($R data, original path, is folder).
+fn recycle_selected() -> Vec<(PathBuf, PathBuf, bool)> {
+    ST.with_borrow(|st| {
+        let (mut out, mut i) = (vec![], -1isize);
+        loop {
+            i = put(st.list, LVM_GETNEXTITEM, i as usize, LVNI_SELECTED as isize);
+            let Some(r) = usize::try_from(i).ok().and_then(|i| st.rows.get(i)) else { break };
+            if let (Some(t), Some(o)) = (&r.target, &r.origin) { out.push((t.clone(), o.clone(), r.dir)); }
+        }
+        out
+    })
+}
+
+/// Moves the deleted data back to its original place; a name clash gets "(2)" like Explorer.
+fn recycle_restore_one(h: HWND, target: &Path, origin: &Path, dir: bool) -> bool {
+    let Some(parent) = origin.parent() else { return false };
+    if !parent.is_dir() {
+        warn(h, &tf!("Исходная папка не существует: {}", "The original folder no longer exists: {}", ja: "元のフォルダーがありません: {}", pt: "A pasta original não existe: {}", zh: "原文件夹已不存在：{}", parent.display()));
+        return false;
+    }
+    let name = origin.file_name().map_or_else(|| target.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+    let dest = if origin.exists() { jobs::free_name(parent, &name, dir) } else { origin.to_path_buf() };
+    match fs::rename(target, &dest) {
+        Ok(()) => {
+            if let Some(meta) = recycle_meta(target) { let _ = fs::remove_file(meta); }
+            true
+        }
+        Err(e) => { warn(h, &format!("{}: {e}", dest.display())); false }
+    }
+}
+
+fn recycle_restore_selected(h: HWND) {
+    for (target, origin, dir) in recycle_selected() { recycle_restore_one(h, &target, &origin, dir); }
+    reload(h);
+}
+
+fn recycle_restore_all(h: HWND) {
+    let rows: Vec<(PathBuf, PathBuf, bool)> = ST.with_borrow(|st| st.rows.iter().filter(|r| !r.hdr).filter_map(|r| Some((r.target.clone()?, r.origin.clone()?, r.dir))).collect());
+    for (target, origin, dir) in rows { recycle_restore_one(h, &target, &origin, dir); }
+    reload(h);
+}
+
+fn recycle_delete_selected(h: HWND) {
+    let sel = recycle_selected();
+    if sel.is_empty() { return; }
+    let text = tf!("Удалить безвозвратно: {}?", "Delete permanently: {}?", ja: "完全に削除しますか: {}?", pt: "Excluir permanentemente: {}?", zh: "永久删除 {} 项？", sel.len());
+    if unsafe { MessageBoxW(h, w(&text).as_ptr(), w("WinRust Explorer").as_ptr(), MB_YESNO | MB_ICONWARNING) } != IDYES { return; }
+    for (target, _, dir) in sel {
+        let r = if dir { fs::remove_dir_all(&target) } else { fs::remove_file(&target) };
+        if let Err(e) = r { warn(h, &format!("{}: {e}", target.display())); }
+        if let Some(meta) = recycle_meta(&target) { let _ = fs::remove_file(meta); }
+    }
+    reload(h);
+}
+
+fn recycle_empty(h: HWND) {
+    unsafe { SHEmptyRecycleBinW(h, ptr::null(), 0) };
+    reload(h);
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn recycle_menu(h: HWND) {
+    let sel = recycle_selected();
+    let m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | if sel.is_empty() { MF_GRAYED } else { 0 }, 1, w(t!("Восстановить", "Restore", ja: "元に戻す", pt: "Restaurar", zh: "还原")).as_ptr());
+    AppendMenuW(m, MF_STRING | if sel.is_empty() { MF_GRAYED } else { 0 }, 2, w(t!("Удалить безвозвратно", "Delete permanently", ja: "完全に削除", pt: "Excluir permanentemente", zh: "永久删除")).as_ptr());
+    AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
+    AppendMenuW(m, MF_STRING, 3, w(t!("Восстановить все", "Restore all", ja: "すべて元に戻す", pt: "Restaurar tudo", zh: "全部还原")).as_ptr());
+    AppendMenuW(m, MF_STRING, 4, w(t!("Очистить корзину", "Empty Recycle Bin", ja: "ごみ箱を空にする", pt: "Esvaziar Lixeira", zh: "清空回收站")).as_ptr());
+    AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
+    AppendMenuW(m, MF_STRING, 5, w(t!("Обновить", "Refresh", ja: "最新の情報に更新", pt: "Atualizar", zh: "刷新")).as_ptr());
+    let mut pt: POINT = std::mem::zeroed();
+    GetCursorPos(&mut pt);
+    let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
+    DestroyMenu(m);
+    match id { 1 => recycle_restore_selected(h), 2 => recycle_delete_selected(h), 3 => recycle_restore_all(h), 4 => recycle_empty(h), 5 => reload(h), _ => {} }
+}
+
 fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
     if !desk() {
+        if let Some(rows) = virtual_rows(dir) { return Some(rows); }
         if let Some((arc, inner)) = zipx::split_zip(dir) { // inside a .zip: its entries are the rows
-            let mut rows: Vec<Row> = zipx::list_dir(&arc, &inner).ok()?.into_iter().map(|i| Row { name: i.name, dir: i.dir, size: i.size, time: zipx::dos_to_filetime(i.time), icon: -1, thumb: -2, hdr: false }).collect();
+            let mut rows: Vec<Row> = zipx::list_dir(&arc, &inner).ok()?.into_iter().map(|i| Row { name: i.name, origin: None, target: None, kind: None, dir: i.dir, size: i.size, time: zipx::dos_to_filetime(i.time), icon: -1, thumb: -2, hdr: false }).collect();
             sort_rows(&mut rows, SORT_COL.load(Relaxed), SORT_ASC.load(Relaxed));
             add_headers(&mut rows);
             return Some(rows);
@@ -857,9 +1047,30 @@ fn load(h: HWND, dir: PathBuf) {
         if !NAV.load(Relaxed) { st.hist.visit(dir.clone()); }
         (st.list, st.tab, st.edit, st.search, st.active, st.rows.len())
     });
-    unsafe { SetWindowTextW(edit, w(&dir.to_string_lossy()).as_ptr()) };
+    let shown_dir = page_name(&dir).map_or_else(|| dir.to_string_lossy().into_owned(), str::to_string);
+    unsafe { SetWindowTextW(edit, w(&shown_dir).as_ptr()) };
     if search != 0 as HWND { unsafe { SetWindowTextW(search, w("").as_ptr()) }; }
-    shellwin::navigated(&dir);
+    if !is_virtual(&dir) { shellwin::navigated(&dir); }
+    let titles: [&str; 4] = match dir.to_string_lossy().as_ref() {
+        "::recycle" => [
+            t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称"),
+            t!("Дата удаления", "Date deleted", ja: "削除日時", pt: "Data de exclusão", zh: "删除日期"),
+            t!("Исходное расположение", "Original location", ja: "元の場所", pt: "Local original", zh: "原位置"),
+            t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"),
+        ],
+        "::thispc" => [
+            t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称"), "",
+            t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型"),
+            t!("Общий размер", "Total size", ja: "合計サイズ", pt: "Tamanho total", zh: "总大小"),
+        ],
+        _ => [
+            t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称"),
+            t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期"),
+            t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型"),
+            t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"),
+        ],
+    };
+    set_column_titles(list, titles);
     ui::set_search(None); // a folder again: the pill shows its path
     tab_text(tab, active, &label(&dir), false);
     ui::nav_dirty(); // the pane highlights where we are
@@ -901,7 +1112,8 @@ fn search(h: HWND, q: &str) {
     }
     if !indexed {
         // no rust-search installed: look through the current folder and below instead
-        rows = local_search(&cur_dir(), q).0;
+        let root = if cur_virtual() { PathBuf::from(env::var_os("USERPROFILE").unwrap_or_else(|| "C:\\".into())) } else { cur_dir() };
+        rows = local_search(&root, q).0;
     }
     let n = rows.len();
     ui::set_search(Some(q.to_string()));
@@ -957,7 +1169,7 @@ fn reload(h: HWND) { load(h, cur_dir()); }
 /// Watches `dir` and posts WM_REFRESH when its listing changes; the previous watcher stops on the generation bump.
 fn start_watch(h: HWND, dir: PathBuf) {
     let era = WATCH_GEN.fetch_add(1, Relaxed) + 1;
-    if desk() || zipx::split_zip(&dir).is_some() { return; }
+    if desk() || is_virtual(&dir) || zipx::split_zip(&dir).is_some() { return; }
     let path = dir.to_string_lossy().replace('/', "\\");
     let main = h as isize;
     std::thread::spawn(move || unsafe {
@@ -1018,7 +1230,7 @@ fn selected() -> (HWND, PathBuf, Vec<PathBuf>) {
         loop {
             i = put(st.list, LVM_GETNEXTITEM, i as usize, LVNI_SELECTED as isize);
             let Some(r) = usize::try_from(i).ok().and_then(|i| st.rows.get(i)) else { break };
-            if !r.hdr { sel.push(st.dir.join(&r.name)); }
+            if !r.hdr { sel.push(r.target.clone().unwrap_or_else(|| st.dir.join(&r.name))); }
         }
         (st.list, st.dir.clone(), sel)
     })
@@ -1030,6 +1242,21 @@ fn col(list: HWND, i: i32, text: &str, width: i32, right: bool) {
     c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT; c.pszText = t.as_mut_ptr(); c.cx = width;
     c.fmt = if right { LVCFMT_RIGHT } else { LVCFMT_LEFT };
     put(list, LVM_INSERTCOLUMNW, i as usize, &c as *const _ as isize);
+}
+
+/// The four real column titles follow the page (the Recycle Bin shows the deletion date and the original location).
+fn set_column_titles(list: HWND, titles: [&str; 4]) {
+    let hdr = put(list, LVM_GETHEADER, 0, 0) as HWND;
+    if hdr.is_null() { return; }
+    for (i, title) in titles.iter().enumerate() {
+        let mut t = w(title);
+        let mut it: HDITEMW = unsafe { std::mem::zeroed() };
+        it.mask = HDI_TEXT;
+        it.pszText = t.as_mut_ptr();
+        it.cchTextMax = t.len() as i32;
+        unsafe { SendMessageW(hdr, HDM_SETITEMW, i, &mut it as *mut _ as isize) };
+    }
+    unsafe { InvalidateRect(hdr, ptr::null(), 0) };
 }
 
 /// Opens a new tab on the current folder.
@@ -2152,19 +2379,20 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     10..=15 => {
                         let (list, dir, paths) = selected();
                         match wp {
-                            10 | 11 if !paths.is_empty() => match real_paths(&paths) { Ok(p) => { let _ = sh::clip_set(h, &p, wp == 10 && !in_zip()); } Err(e) => warn(h, &e) },
+                            10 | 11 if !paths.is_empty() && !cur_virtual() => match real_paths(&paths) { Ok(p) => { let _ = sh::clip_set(h, &p, wp == 10 && !in_zip()); } Err(e) => warn(h, &e) },
                             12 => { paste(h, &dir); reload(h); }
-                            13 if !in_zip() => {
+                            13 if !in_zip() && !cur_virtual() => {
                                 let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
                                 if i >= 0 { SetFocus(list); put(list, LVM_EDITLABELW, i as usize, 0); }
                             }
-                            14 if !paths.is_empty() && !in_zip() => { let _ = sh::fileop(h, sh::Op::Delete, &paths, &dir); reload(h); }
-                            15 => create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true),
+                            14 if !paths.is_empty() && !in_zip() && !cur_virtual() => { let _ = sh::fileop(h, sh::Op::Delete, &paths, &dir); reload(h); }
+                            15 if !cur_virtual() => create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true),
                             _ => {}
                         }
                     }
                     16..=19 => {
                         let dir = cur_dir();
+                        if cur_virtual() { return 0; }
                         match wp {
                             18 => create_new(h, &dir, t!("Новый текстовый документ.txt", "New text document.txt", ja: "新しいテキスト ドキュメント.txt", pt: "Novo documento de texto.txt", zh: "新建文本文档.txt"), false),
                             19 => new_zip(h, &dir),
@@ -2284,8 +2512,16 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             let State { dir, rows, view, .. } = &mut *st;
                             let Some(i) = usize::try_from(it.iItem).ok() else { return };
                             let Some(r) = rows.get_mut(i) else { return };
+                            let actual = r.origin.clone().or_else(|| r.target.clone()).unwrap_or_else(|| dir.join(&r.name));
+                            let thumb_path = r.target.clone().unwrap_or_else(|| dir.join(&r.name));
                             if it.mask & LVIF_TEXT != 0 && it.cchTextMax > 0 {
-                                let s = if r.hdr { if it.iSubItem == 0 { r.name[1..].to_string() } else { String::new() } } else { match it.iSubItem { 0 => shown_name(&r.name, desk(), r.dir), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir => String::new(), _ => size_text(r.size) } };
+                                let s = if r.hdr { if it.iSubItem == 0 { r.name[1..].to_string() } else { String::new() } } else { match it.iSubItem {
+                                    0 => if r.target.is_some() { r.name.clone() } else { shown_name(&r.name, desk(), r.dir) },
+                                    1 => date_text(r.time),
+                                    2 => r.kind.clone().unwrap_or_else(|| type_text(&r.name, r.dir)),
+                                    _ if r.dir && r.target.is_none() => String::new(),
+                                    _ => size_text(r.size),
+                                } };
                                 let u: Vec<u16> = s.encode_utf16().take(it.cchTextMax as usize - 1).collect();
                                 ptr::copy_nonoverlapping(u.as_ptr(), it.pszText, u.len());
                                 *it.pszText.add(u.len()) = 0;
@@ -2294,18 +2530,18 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             if it.mask & LVIF_IMAGE != 0 && view.wants_thumbs() {
                                 if r.thumb == -2 {
                                     r.thumb = -1;
-                                    if let Some(tx) = TX.get() { let _ = tx.send((GEN.load(std::sync::atomic::Ordering::Relaxed), i, dir.join(&r.name), view.icon_px())); }
+                                    if let Some(tx) = TX.get() { let _ = tx.send((GEN.load(std::sync::atomic::Ordering::Relaxed), i, thumb_path, view.icon_px())); }
                                 }
                                 it.iImage = if r.thumb >= 0 { r.thumb } else { I_IMAGENONE };
                             } else if it.mask & LVIF_IMAGE != 0 {
-                                if r.icon < 0 { r.icon = icon_of(&dir.join(&r.name), r.dir); }
+                                if r.icon < 0 { r.icon = icon_of(&actual, r.dir); }
                                 it.iImage = r.icon;
                             }
                         });
                     }
                     LVN_ITEMACTIVATE => {
                         let i = (*(lp as *const NMITEMACTIVATE)).iItem;
-                        let hit = ST.with_borrow(|st| usize::try_from(i).ok().and_then(|i| st.rows.get(i)).filter(|r| !r.hdr).map(|r| (st.dir.join(&r.name), r.dir)));
+                        let hit = ST.with_borrow(|st| usize::try_from(i).ok().and_then(|i| st.rows.get(i)).filter(|r| !r.hdr).map(|r| (r.target.clone().unwrap_or_else(|| st.dir.join(&r.name)), r.dir)));
                         if let Some((p, is_dir)) = hit { activate(h, p, is_dir); }
                     }
                     NM_CLICK if nm.hwndFrom == list => {
@@ -2334,7 +2570,9 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 }
                                 SetFocus(list);
                                 let (_, dir, paths) = selected();
-                                if !paths.is_empty() { item_menu(h, &dir, &paths); }
+                                if !paths.is_empty() {
+                                    if dir.to_string_lossy() == "::recycle" { recycle_menu(h) } else { item_menu(h, &dir, &paths) }
+                                }
                             }
                             None => {
                                 let mut it: LVITEMW = std::mem::zeroed();
@@ -2383,10 +2621,10 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         match vk {
                             0x08 => if let Some(p) = dir.parent() { load(h, p.to_path_buf()) },
                             0x1B if jobs::busy() => { jobs::cancel(); return 0; } // Esc stops packing / unpacking
-                            0x2E if !paths.is_empty() && !in_zip() => { let _ = sh::fileop(h, sh::Op::Delete, &paths, &dir); }
+                            0x2E if !paths.is_empty() && !in_zip() && !cur_virtual() => { let _ = sh::fileop(h, sh::Op::Delete, &paths, &dir); }
                             // Space: a quick look. Pictures open in photoview, videos / text / anything else in its default app
                             0x20 if !desk() => if let Some(p) = paths.first().filter(|p| p.is_file()) { activate(h, p.clone(), false); },
-                            0x71 if !in_zip() => {
+                            0x71 if !in_zip() && !cur_virtual() => {
                                 let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
                                 if i >= 0 { put(list, LVM_EDITLABELW, i as usize, 0); }
                             }
@@ -2399,7 +2637,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             }
                             0x5D if !paths.is_empty() => item_menu(h, &dir, &paths),
                             0x43 if ctrl && shift => { copy_path(h); return 0; } // Ctrl+Shift+C: copy path
-                            0x43 | 0x58 if ctrl && !paths.is_empty() => { // from a zip: real files in the temp folder, and only a copy (nothing can be cut out of an archive)
+                            0x43 | 0x58 if ctrl && !paths.is_empty() && !cur_virtual() => { // from a zip: real files in the temp folder, and only a copy (nothing can be cut out of an archive)
                                 match real_paths(&paths) { Ok(p) => { let _ = sh::clip_set(h, &p, vk == 0x58 && !in_zip()); } Err(e) => warn(h, &e) }
                                 return 0;
                             }
@@ -2411,7 +2649,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 return 0;
                             }
                             0x56 if ctrl => paste(h, &dir),
-                            0x4E if ctrl && shift => { create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true); return 0; }
+                            0x4E if ctrl && shift && !cur_virtual() => { create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true); return 0; }
                             0x4E if ctrl => { new_window(); return 0; } // Ctrl+N: a new window, like Explorer
                             0x48 if ctrl => { SHOW_HIDDEN.fetch_xor(true, Relaxed); } // Ctrl+H: hidden files
                             0x74 => {} // F5: just the reload below
@@ -2430,6 +2668,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         reload(h);
                     }
                     LVN_BEGINLABELEDITW => {
+                        if cur_virtual() { return 1; }
                         let hdr = ST.with_borrow(|st| usize::try_from((*(lp as *const NMLVDISPINFOW)).item.iItem).ok().and_then(|i| st.rows.get(i)).is_some_and(|r| r.hdr));
                         if hdr { return 1; } // a heading cannot be renamed
                         let e = SendMessageW(ST.with_borrow(|st| st.list), LVM_GETEDITCONTROL, 0, 0) as HWND;
@@ -2532,7 +2771,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         if !q.trim().is_empty() { search(h, q.trim()); SetFocus(list); return 0; } // keep the query in the bar
                     } else if p.is_dir() || zipx::split_zip(&p).is_some() { load(h, p); } // also a path inside a .zip
                 }
-                SetWindowTextW(edit, w(&cur_dir().to_string_lossy()).as_ptr()); // also undoes a bad path / Esc
+                SetWindowTextW(edit, w(&page_name(&cur_dir()).map_or_else(|| cur_dir().to_string_lossy().into_owned(), str::to_string)).as_ptr()); // also undoes a bad path / Esc
                 SetFocus(list);
                 0
             }
@@ -2641,6 +2880,30 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn recycle_records_give_the_original_name_and_place() {
+        let d = std::env::temp_dir().join(format!("rx-recycle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let original = r"C:\Temp\note.txt";
+        let mut b = Vec::new();
+        b.extend(2u64.to_le_bytes());
+        b.extend(123u64.to_le_bytes());
+        b.extend(132_000_000_000_000_000u64.to_le_bytes());
+        let u: Vec<u16> = original.encode_utf16().chain([0]).collect();
+        b.extend((u.len() as u32).to_le_bytes());
+        for c in &u { b.extend(c.to_le_bytes()); }
+        let meta = d.join("$IABC");
+        fs::write(&meta, &b).unwrap();
+        fs::write(d.join("$RABC"), "x").unwrap();
+        let r = parse_recycle(&meta, &b).unwrap();
+        assert_eq!(r.name, "note.txt");
+        assert_eq!(r.origin.as_deref(), Some(Path::new(original)));
+        assert!(r.target.as_ref().is_some_and(|p| p.ends_with("$RABC")));
+        assert_eq!(r.size, 123);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn window_place_parses_and_rejects_junk() {
         let (max, r) = super::parse_place("max 10 20 1010 680").unwrap();
         assert!(max);
@@ -2693,7 +2956,7 @@ mod tests {
 
     use super::*;
 
-    fn r(name: &str, dir: bool, size: u64, time: u64) -> Row { Row { name: name.into(), dir, size, time, icon: -1, thumb: -2 , hdr: false } }
+    fn r(name: &str, dir: bool, size: u64, time: u64) -> Row { Row { name: name.into(), origin: None, target: None, kind: None, dir, size, time, icon: -1, thumb: -2 , hdr: false } }
     fn names(v: &[Row]) -> Vec<&str> { v.iter().map(|r| r.name.as_str()).collect() }
 
     #[test]
