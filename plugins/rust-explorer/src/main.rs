@@ -867,6 +867,7 @@ fn load(h: HWND, dir: PathBuf) {
     reset_thumbs();
     put(list, LVM_DELETEALLITEMS, 0, 0);
     if desk() { desk::fill(list, n); } else { put(list, LVM_SETITEMCOUNT, n, 0); }
+    if !desk() { unsafe { ui::fit_filler(list) }; }
     unsafe { ui::status_dirty(h) }; // the counts belong to the folder that was just opened
     start_watch(h, dir);
 }
@@ -1125,7 +1126,7 @@ fn ensure_iml(list: HWND, px: i32) {
 fn apply_view(list: HWND, view: ViewMode) {
     ui::row_height(list, view == ViewMode::Details);
     match view {
-        ViewMode::Details => { put(list, LVM_SETVIEW, LV_VIEW_DETAILS as usize, 0); }
+        ViewMode::Details => { put(list, LVM_SETVIEW, LV_VIEW_DETAILS as usize, 0); unsafe { ui::fit_filler(list) }; }
         ViewMode::List => { put(list, LVM_SETVIEW, LV_VIEW_LIST as usize, 0); }
         ViewMode::Small => { put(list, LVM_SETVIEW, LV_VIEW_SMALLICON as usize, 0); }
         ViewMode::Medium | ViewMode::Large | ViewMode::ExtraLarge => { ensure_iml(list, view.icon_px()); put(list, LVM_SETVIEW, LV_VIEW_ICON as usize, 0); }
@@ -2084,6 +2085,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     col(list, 1, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期"), ui::sc(160), false);
                     col(list, 2, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型"), ui::sc(140), false);
                     col(list, 3, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"), ui::sc(96), true);
+                    col(list, 4, "", ui::sc(100), false); // blank strip after the real columns
                     ui::style_list(list);
                 }
                 ST.with_borrow_mut(|st| { st.list = list; st.tab = tab; st.edit = edit; st.search = search; st.tabs = vec![PathBuf::new()]; });
@@ -2344,6 +2346,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     }
                     LVN_COLUMNCLICK => {
                         let c = (*(lp as *const NMLISTVIEW)).iSubItem as usize;
+                        if c >= 4 { return 0; } // the blank filler column does not sort
                         let asc = if SORT_COL.load(Relaxed) == c { !SORT_ASC.load(Relaxed) } else { true };
                         SORT_COL.store(c, Relaxed);
                         SORT_ASC.store(asc, Relaxed);

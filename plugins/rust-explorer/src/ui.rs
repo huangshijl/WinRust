@@ -220,14 +220,23 @@ pub unsafe fn restyle(h: HWND) {
 /// Dark list: themed scrollbars and header, own colours and font, taller rows.
 pub fn style_list(list: HWND) {
     unsafe {
-        SetWindowTheme(list, w("DarkMode_Explorer").as_ptr(), ptr::null());
+        // the header's unused strip follows the list theme: a dark theme on a light window leaves it black
+        SetWindowTheme(list, w(if light() { "Explorer" } else { "DarkMode_Explorer" }).as_ptr(), ptr::null());
         let hdr = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
-        SetWindowTheme(hdr, w("DarkMode_ItemsView").as_ptr(), ptr::null());
+        SetWindowTheme(hdr, w(if light() { "ItemsView" } else { "DarkMode_ItemsView" }).as_ptr(), ptr::null());
         for (m, c) in [(LVM_SETBKCOLOR, listbg()), (LVM_SETTEXTBKCOLOR, listbg()), (LVM_SETTEXTCOLOR, pal().text)] { SendMessageW(list, m, 0, c as isize); }
         SendMessageW(list, WM_SETFONT, font(14, 400, ui_face()) as usize, 1);
         row_height(list, true);
         SetWindowSubclass(list, Some(list_sub), 1, 0); // paints the column header (the theme alone leaves it dim)
     }
+}
+
+/// A blank last column fills the rest of the list width, so the header has no empty strip to paint.
+pub unsafe fn fit_filler(list: HWND) {
+    let mut cr: RECT = std::mem::zeroed();
+    GetClientRect(list, &mut cr);
+    let rest: i32 = (0..4).map(|k| SendMessageW(list, LVM_GETCOLUMNWIDTH, k, 0) as i32).sum();
+    SendMessageW(list, LVM_SETCOLUMNWIDTH, 4, (cr.right - rest).max(0) as isize);
 }
 
 pub const ROW_H: i32 = 28;
@@ -406,10 +415,12 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
         if nm.hdr.hwndFrom == hdr {
             use windows_sys::Win32::UI::Controls::{HDN_DIVIDERDBLCLICKW, HDN_ENDTRACKW, NMHEADERW};
             if nm.hdr.code == HDN_ENDTRACKW {
+                fit_filler(h);
                 crate::save_current_view(); // the folder remembers its column widths
             } else if nm.hdr.code == HDN_DIVIDERDBLCLICKW {
                 let i = (*(lp as *const NMHEADERW)).iItem as usize;
                 SendMessageW(h, LVM_SETCOLUMNWIDTH, i, LVSCW_AUTOSIZE_USEHEADER as isize);
+                fit_filler(h);
                 crate::save_current_view();
                 return 0;
             }
@@ -427,6 +438,7 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
                     let b = CreateSolidBrush(listbg());
                     FillRect(dc, &r, b);
                     DeleteObject(b);
+                    if i == 4 { return CDRF_SKIPDEFAULT as isize; } // the blank strip after the real columns
                     let mut buf = [0u16; 128];
                     let mut it: HDITEMW = std::mem::zeroed();
                     it.mask = HDI_TEXT;
@@ -1407,6 +1419,7 @@ pub unsafe fn layout_children(cw: i32, ch: i32) {
     MoveWindow(chrome, 0, 0, cw, top, 1);
     MoveWindow(nav, 0, top, nw, h, 1);
     MoveWindow(list, nw, top, cw - nw, h, 1);
+    fit_filler(list);
     nav_ensure_current();
 }
 
