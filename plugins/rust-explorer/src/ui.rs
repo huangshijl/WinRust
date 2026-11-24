@@ -1167,24 +1167,88 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
 }
 
 
-// ---------- navigation pane (left): quick access folders and the drives, like Explorer's ----------
+// ---------- navigation pane (left): sections, quick access folders, drives and an expandable folder tree ----------
 
-pub const NAV_W: i32 = 232;
-const NAV_ROW: i32 = 34;
-const NAV_HEAD: i32 = 32;
+const NAV_W_DEFAULT: i32 = 240;
+const NAV_ROW: i32 = 32;
+const NAV_HEAD: i32 = 30;
+const NAV_DRIVE: i32 = 48; // a drive row also shows how full it is
 
-struct NavItem { title: String, path: PathBuf, glyph: &'static str, cap: Option<(u64, u64)> } // empty path = section heading; cap = (free, total) bytes of a drive
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum NavKind { Section, Home, Folder, Drive, Recycle, ThisPC }
 
-const NAV_DRIVE: i32 = 52; // a drive row also shows how full it is
+struct NavItem { title: String, path: PathBuf, glyph: &'static str, cap: Option<(u64, u64)>, depth: i32, kind: NavKind, expandable: bool, expanded: bool }
 
 fn nav_h(it: &NavItem) -> i32 {
-    sc(if it.path.as_os_str().is_empty() { NAV_HEAD } else if it.cap.is_some() { NAV_DRIVE } else { NAV_ROW })
+    sc(if it.kind == NavKind::Section { NAV_HEAD } else if it.cap.is_some() { NAV_DRIVE } else { NAV_ROW })
 }
 
 thread_local! {
     static NAV: RefCell<Vec<NavItem>> = const { RefCell::new(Vec::new()) };
     static NAVWND: Cell<isize> = const { Cell::new(0) };
     static NAVHOT: Cell<i32> = const { Cell::new(-1) };
+    static NAV_OPEN: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new()); // expanded folder paths
+    static NAV_SCROLL: Cell<i32> = const { Cell::new(0) };
+    static NAV_WIDTH: Cell<i32> = const { Cell::new(NAV_W_DEFAULT) };
+    static NAV_DRAG: Cell<Option<(i32, i32)>> = const { Cell::new(None) }; // (start x, start width)
+}
+
+fn nav_width_file() -> Option<PathBuf> { env::var_os("APPDATA").map(|a| PathBuf::from(a).join("rust-explorer").join("nav-width.txt")) }
+
+pub fn nav_width() -> i32 { NAV_WIDTH.get() }
+
+/// Subfolders of `dir` for an expanded node, hidden and system ones left out.
+fn nav_children(dir: &Path, depth: i32) -> Vec<NavItem> {
+    let mut out: Vec<(String, NavItem)> = vec![];
+    let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
+    for e in rd.flatten() {
+        let Ok(m) = e.metadata() else { continue };
+        if !m.is_dir() || m.file_attributes() & (2 | 4) != 0 { continue; } // hidden / system
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('$') { continue; } // $Recycle.Bin, System Volume Information
+        out.push((name.to_lowercase(), NavItem { title: name, path: e.path(), glyph: "\u{E8B7}", cap: None, depth, kind: NavKind::Folder, expandable: true, expanded: false }));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.truncate(500);
+    out.into_iter().map(|(_, it)| it).collect()
+}
+
+/// Inserts the subfolders of node `i` right after it (one level deeper).
+fn expand_vec(v: &mut Vec<NavItem>, i: usize) {
+    if i >= v.len() || v[i].expanded || !v[i].expandable { return; }
+    let (path, depth) = (v[i].path.clone(), v[i].depth);
+    v[i].expanded = true;
+    if path.to_string_lossy().starts_with("::") { return; }
+    let kids = nav_children(&path, depth + 1);
+    if kids.is_empty() { v[i].expandable = false; return; }
+    NAV_OPEN.with_borrow_mut(|s| { s.insert(path.to_string_lossy().to_lowercase()); });
+    v.splice(i + 1..i + 1, kids);
+}
+
+/// Removes the subfolders under node `i`.
+fn collapse_vec(v: &mut Vec<NavItem>, i: usize) {
+    if i >= v.len() || !v[i].expanded { return; }
+    let depth = v[i].depth;
+    let mut end = i + 1;
+    while end < v.len() && v[end].depth > depth { 
+        let p = v[end].path.to_string_lossy().to_lowercase();
+        NAV_OPEN.with_borrow_mut(|s| { s.remove(&p); });
+        end += 1;
+    }
+    v.drain(i + 1..end);
+    v[i].expanded = false;
+    NAV_OPEN.with_borrow_mut(|s| { s.remove(&v[i].path.to_string_lossy().to_lowercase()); });
+}
+
+fn expand_node(h: HWND, i: usize) {
+    NAV.with_borrow_mut(|v| expand_vec(v, i));
+    unsafe { InvalidateRect(h, ptr::null(), 0) };
+}
+
+fn collapse_node(h: HWND, i: usize) {
+    NAV.with_borrow_mut(|v| collapse_vec(v, i));
+    unsafe { InvalidateRect(h, ptr::null(), 0) };
 }
 
 /// Folders the user pinned to Quick access: %APPDATA%\WinRust\rust-explorer-pins.txt, one path per line.
@@ -1208,9 +1272,14 @@ pub fn toggle_pin(p: &Path) {
 
 pub fn nav_init(h: HWND) {
     NAVWND.set(h as isize);
+    if let Some(f) = nav_width_file() {
+        if let Ok(s) = fs::read_to_string(f) { if let Ok(w) = s.trim().parse::<i32>() { NAV_WIDTH.set(w.clamp(180, 520)); } }
+    }
     let home = PathBuf::from(env::var_os("USERPROFILE").unwrap_or_default());
-    let head = |lbl: &str| NavItem { title: lbl.into(), path: PathBuf::new(), glyph: "", cap: None };
-    let mut v = vec![head(t!("Быстрый доступ", "Quick access", ja: "クイック アクセス", pt: "Acesso rápido", zh: "快速访问")), NavItem { title: t!("Главная", "Home", ja: "ホーム", pt: "Início", zh: "主页").into(), path: home.clone(), glyph: "\u{E80F}", cap: None }];
+    let section = |lbl: &str| NavItem { title: lbl.into(), path: PathBuf::new(), glyph: "", cap: None, depth: 0, kind: NavKind::Section, expandable: false, expanded: false };
+    let node = |title: String, path: PathBuf, glyph: &'static str, kind: NavKind, expandable: bool| NavItem { title, path, glyph, cap: None, depth: 1, kind, expandable, expanded: false };
+    let mut v = vec![section(t!("Быстрый доступ", "Quick access", ja: "クイック アクセス", pt: "Acesso rápido", zh: "快速访问"))];
+    v.push(node(t!("Главная", "Home", ja: "ホーム", pt: "Início", zh: "主页").into(), home.clone(), "\u{E80F}", NavKind::Home, false));
     use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos};
     let known = [
         (t!("Рабочий стол", "Desktop", ja: "デスクトップ", pt: "Área de Trabalho", zh: "桌面"), &FOLDERID_Desktop, "\u{E7F4}"),
@@ -1222,12 +1291,12 @@ pub fn nav_init(h: HWND) {
     ];
     for (lbl, id, g) in known {
         let Some(p) = crate::sh::known_dir(id).filter(|p| p.is_dir()) else { continue };
-        v.push(NavItem { title: lbl.into(), path: p, glyph: g, cap: None });
+        v.push(node(lbl.into(), p, g, NavKind::Folder, true));
     }
     for p in pins() {
-        if p.is_dir() { v.push(NavItem { title: p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned()), path: p, glyph: "\u{E718}", cap: None }); }
+        if p.is_dir() { v.push(node(p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned()), p, "\u{E718}", NavKind::Folder, true)); }
     }
-    v.push(head(t!("Этот компьютер", "This PC", ja: "PC", pt: "Este Computador", zh: "此电脑")));
+    v.push(section(t!("Этот компьютер", "This PC", ja: "PC", pt: "Este Computador", zh: "此电脑")));
     unsafe {
         use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
         let mask = GetLogicalDrives();
@@ -1239,7 +1308,9 @@ pub fn nav_init(h: HWND) {
             let ty = GetDriveTypeW(w(&root).as_ptr());
             if ty == 4 {
                 // a mapped network drive: listed without label and size, they would stall the window while a share is down
-                v.push(NavItem { title: tf!("Сетевой диск ({}:)", "Network Drive ({}:)", ja: "ネットワーク ドライブ ({}:)", pt: "Unidade de rede ({}:)", zh: "网络驱动器（{}:）", letter), path: PathBuf::from(root), glyph: "\u{E8CE}", cap: None });
+                let mut it = node(tf!("Сетевой диск ({}:)", "Network Drive ({}:)", ja: "ネットワーク ドライブ ({}:)", pt: "Unidade de rede ({}:)", zh: "网络驱动器（{}:）", letter), PathBuf::from(root), "\u{E8CE}", NavKind::Drive, true);
+                it.cap = None;
+                v.push(it);
                 continue;
             }
             if !matches!(ty, 2 | 3) { continue; }
@@ -1249,10 +1320,72 @@ pub fn nav_init(h: HWND) {
             let (mut free, mut total) = (0u64, 0u64);
             let cap = (GetDiskFreeSpaceExW(w(&root).as_ptr(), &mut free, &mut total, ptr::null_mut()) != 0 && total > 0).then_some((free, total));
             let base = if name.is_empty() { t!("Локальный диск", "Local Disk", ja: "ローカル ディスク", pt: "Disco local", zh: "本地磁盘") } else { &name };
-            v.push(NavItem { title: format!("{base} ({letter}:)"), path: PathBuf::from(root), glyph: "\u{EDA2}", cap });
+            let mut it = node(format!("{base} ({letter}:)"), PathBuf::from(root), "\u{EDA2}", NavKind::Drive, true);
+            it.cap = cap;
+            v.push(it);
         }
     }
+    // expand the folders that were open before (the current folder's chain is opened again by nav_sync)
+    let mut i = 0;
+    while i < v.len() {
+        if v[i].expandable && !v[i].expanded && NAV_OPEN.with_borrow(|s| s.contains(&v[i].path.to_string_lossy().to_lowercase())) {
+            expand_vec(&mut v, i);
+        }
+        i += 1;
+    }
     NAV.with_borrow_mut(|n| *n = v);
+    let cur = crate::cur_dir();
+    if !cur.as_os_str().is_empty() { nav_sync(&cur); }
+}
+
+/// Scrolls the pane so the row of the current folder is in view (called after expanding and after a resize).
+fn nav_ensure_current() {
+    let h = NAVWND.get() as HWND;
+    if h.is_null() { return; }
+    let mut cr: RECT = unsafe { std::mem::zeroed() };
+    unsafe { GetClientRect(h, &mut cr) };
+    if cr.bottom <= 0 { NAV_SCROLL.set(0); return; }
+    let cur = ST.with(|c| c.try_borrow().ok().map(|s| s.dir.to_string_lossy().to_lowercase())).unwrap_or_default();
+    if cur.is_empty() { return; }
+    NAV.with_borrow(|v| {
+        let Some(idx) = v.iter().enumerate().filter(|(_, it)| it.kind != NavKind::Section && !it.path.as_os_str().is_empty() && cur.starts_with(&it.path.to_string_lossy().to_lowercase())).max_by_key(|(_, it)| it.path.as_os_str().len()).map(|(i, _)| i) else { return };
+        let mut y = sc(8);
+        for it in v.iter().take(idx) { y += nav_h(it); }
+        let hgt = nav_h(&v[idx]);
+        let scroll = NAV_SCROLL.get();
+        let next = if y < scroll { y } else if y + hgt > scroll + cr.bottom { y + hgt - cr.bottom } else { scroll };
+        let content: i32 = v.iter().map(nav_h).sum();
+        NAV_SCROLL.set(next.clamp(0, (content + sc(8) * 2 - cr.bottom).max(0)));
+    });
+}
+
+/// Opens the tree down to `dir` so the current folder is visible in the pane.
+pub fn nav_sync(dir: &Path) {
+    if dir.as_os_str().is_empty() || dir.to_string_lossy().starts_with("::") { return; }
+    let d = dir.to_string_lossy().to_lowercase();
+    NAV.with_borrow_mut(|v| {
+        let mut best: Option<usize> = None;
+        let mut best_len = 0;
+        for (i, it) in v.iter().enumerate() {
+            if it.kind == NavKind::Section { continue; }
+            let p = it.path.to_string_lossy().to_lowercase();
+            if !p.is_empty() && d.starts_with(&p) && p.len() > best_len { best = Some(i); best_len = p.len(); }
+        }
+        let Some(mut idx) = best else { return };
+        for _ in 0..8 {
+            if !v[idx].expanded { expand_vec(v, idx); }
+            let base = v[idx].path.clone();
+            let base_s = base.to_string_lossy();
+            let d_s = dir.to_string_lossy();
+            let rest = if d_s.len() > base_s.len() { d_s[base_s.len()..].trim_start_matches(['\\', '/']) } else { "" };
+            let Some(comp) = rest.split(['\\', '/']).find(|s| !s.is_empty()) else { break };
+            let want = base.join(comp).to_string_lossy().to_lowercase();
+            let Some(child) = (idx + 1..v.len()).take_while(|&j| v[j].depth > v[idx].depth).find(|&j| v[j].path.to_string_lossy().to_lowercase() == want) else { break };
+            idx = child;
+        }
+    });
+    nav_ensure_current();
+    nav_dirty();
 }
 
 pub fn nav_path(i: usize) -> Option<PathBuf> {
@@ -1269,20 +1402,38 @@ pub unsafe fn layout_children(cw: i32, ch: i32) {
     let (chrome, list) = ST.with(|c| c.try_borrow().map_or((ptr::null_mut(), ptr::null_mut()), |s| (s.tab, s.list)));
     let nav = NAVWND.get() as HWND;
     let (top, status) = (sc(CHROME_H), sc(STATUS_H));
-    let nw = if cw > sc(760) { sc(NAV_W) } else { 0 };
+    let nw = if cw > sc(760) { sc(nav_width()) } else { 0 };
     let h = (ch - top - status).max(0);
     MoveWindow(chrome, 0, 0, cw, top, 1);
     MoveWindow(nav, 0, top, nw, h, 1);
     MoveWindow(list, nw, top, cw - nw, h, 1);
+    nav_ensure_current();
 }
 
-/// Item under y (None over headings or empty space).
-fn nav_hit(y: i32) -> Option<usize> {
-    let mut top = sc(8);
+/// Row under y, whatever x (for the context menu).
+fn nav_row_at(y: i32) -> Option<usize> {
+    let mut top = sc(8) - NAV_SCROLL.get();
     NAV.with_borrow(|n| {
         for (i, it) in n.iter().enumerate() {
             let hgt = nav_h(it);
-            if y >= top && y < top + hgt { return (!it.path.as_os_str().is_empty()).then_some(i); }
+            if y >= top && y < top + hgt { return (it.kind != NavKind::Section).then_some(i); }
+            top += hgt;
+        }
+        None
+    })
+}
+
+/// Node under (x, y) and whether the click is on its expand chevron.
+fn nav_node_at(x: i32, y: i32) -> Option<(usize, bool)> {
+    let mut top = sc(8) - NAV_SCROLL.get();
+    NAV.with_borrow(|n| {
+        for (i, it) in n.iter().enumerate() {
+            let hgt = nav_h(it);
+            if y >= top && y < top + hgt {
+                if it.kind == NavKind::Section { return None; }
+                let indent = sc(8) + it.depth * sc(16);
+                return Some((i, it.expandable && x >= indent - sc(2) && x < indent + sc(14)));
+            }
             top += hgt;
         }
         None
@@ -1301,43 +1452,52 @@ unsafe fn paint_nav(hwnd: HWND) {
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
     SetBkMode(dc, TRANSPARENT as i32);
-    let (f_txt, f_head, f_glyph, f_small) = (font(13, 400, ui_face()) as HFONT, font(12, 600, ui_face()) as HFONT, font(16, 400, winrust_common::style::icon_face()) as HFONT, font(11, 400, ui_face()) as HFONT);
+    let (f_txt, f_head, f_glyph, f_small, f_chev) = (font(13, 400, ui_face()) as HFONT, font(12, 600, ui_face()) as HFONT, font(16, 400, winrust_common::style::icon_face()) as HFONT, font(11, 400, ui_face()) as HFONT, font(10, 400, winrust_common::style::icon_face()) as HFONT);
     let of = SelectObject(dc, f_txt);
-    // where we are = the deepest item that contains the current folder
+    // where we are = the deepest node that contains the current folder
     let cur = ST.with(|c| c.try_borrow().ok().map(|s| s.dir.to_string_lossy().to_lowercase())).unwrap_or_default();
     let hot = NAVHOT.get();
+    let scroll = NAV_SCROLL.get();
     NAV.with_borrow(|n| {
-        let here = n.iter().enumerate().filter(|(_, it)| !it.path.as_os_str().is_empty() && cur.starts_with(&it.path.to_string_lossy().to_lowercase())).max_by_key(|(_, it)| it.path.as_os_str().len()).map(|(i, _)| i);
-        let mut y = sc(8);
+        let here = n.iter().enumerate().filter(|(_, it)| it.kind != NavKind::Section && !it.path.as_os_str().is_empty() && cur.starts_with(&it.path.to_string_lossy().to_lowercase())).max_by_key(|(_, it)| it.path.as_os_str().len()).map(|(i, _)| i);
+        let mut y = sc(8) - scroll;
         for (i, it) in n.iter().enumerate() {
-            if it.path.as_os_str().is_empty() {
+            let hgt = nav_h(it);
+            if y + hgt < 0 { y += hgt; continue; }
+            if y > cr.bottom { break; }
+            if it.kind == NavKind::Section {
                 SelectObject(dc, f_head);
-                text(dc, &it.title.to_uppercase(), rc(sc(18), y + sc(6), cr.right - sc(8), y + sc(NAV_HEAD)), pal().dim, DT_LEFT);
-                y += sc(NAV_HEAD);
+                text(dc, &it.title, rc(sc(16), y + sc(4), cr.right - sc(8), y + hgt), pal().dim, DT_LEFT);
+                y += hgt;
                 continue;
             }
-            let hgt = nav_h(it);
+            let indent = sc(8) + it.depth * sc(16);
             let r = rc(sc(8), y, cr.right - sc(8), y + hgt);
             let (th, ta) = (hv(5000 + i as i32, hot == i as i32), hv(6000 + i as i32, here == Some(i)));
             let p = press_t(5000 + i as i32);
-            if th.max(ta) > 0.01 || p > 0.0 { fill(dc, r, mix(mix(mix(pal().bg, pal().hover, th), pal().active, ta), pal().accent, 0.3 * p), sc(10)); }
-            if ta > 0.01 { fill(dc, rc(r.left, y + sc(10), r.left + sc(3), y + hgt - sc(10)), mix(pal().active, pal().accent, ta), sc(3)); }
-            let line = rc(r.left, y, r.right, y + sc(NAV_ROW)); // the title line (a drive has its usage bar below it)
+            if th.max(ta) > 0.01 || p > 0.0 { fill(dc, r, mix(mix(mix(pal().bg, pal().hover, th), pal().active, ta), pal().accent, 0.3 * p), sc(6)); }
+            if ta > 0.01 { fill(dc, rc(r.left, y + sc(8), r.left + sc(3), y + hgt - sc(8)), mix(pal().active, pal().accent, ta), sc(3)); }
+            let line = rc(indent, y, cr.right - sc(8), y + sc(NAV_ROW)); // the title line (a drive has its usage bar below it)
+            if it.expandable {
+                SelectObject(dc, f_chev);
+                text(dc, if it.expanded { "\u{E70D}" } else { "\u{E76C}" }, rc(indent - sc(2), line.top, indent + sc(14), line.bottom), mix(pal().dim, pal().text, th * 0.6), DT_CENTER);
+            }
             SelectObject(dc, f_glyph);
-            text(dc, it.glyph, rc(r.left + sc(10), line.top, r.left + sc(40), line.bottom), mix(pal().dim, pal().accent, ta), DT_CENTER);
+            text(dc, it.glyph, rc(indent + sc(16), line.top, indent + sc(36), line.bottom), mix(pal().dim, pal().accent, ta), DT_CENTER);
             SelectObject(dc, f_txt);
-            text(dc, &it.title, rc(r.left + sc(48), line.top, r.right - sc(8), line.bottom), mix(pal().dim, pal().text, ta.max(th)), DT_LEFT);
+            let text_x = indent + sc(40);
+            text(dc, &it.title, rc(text_x, line.top, cr.right - sc(8), line.bottom), mix(pal().dim, pal().text, ta.max(th)), DT_LEFT);
             if let Some((free, total)) = it.cap {
                 // usage bar like Windows' "This PC": accent, red once the drive is more than 90 % full
                 let used = 1.0 - free as f32 / total as f32;
-                let bar = rc(r.left + sc(48), y + sc(30), r.right - sc(14), y + sc(34));
+                let bar = rc(text_x, y + sc(28), cr.right - sc(14), y + sc(32));
                 fill(dc, bar, mix(pal().bg, pal().text, 0.12), sc(4));
                 let fw = ((bar.right - bar.left) as f32 * used) as i32;
                 fill(dc, rc(bar.left, bar.top, bar.left + fw.max(sc(4)), bar.bottom), if used > 0.9 { winrust_common::style::BAD } else { pal().accent }, sc(4));
                 SelectObject(dc, f_small);
                 let gb = |b: u64| b as f64 / 1_073_741_824.0;
                 let free_total = tf!("{:.0} ГБ свободно из {:.0} ГБ", "{:.0} GB free of {:.0} GB", ja: "{:.0} GB 空き / {:.0} GB", pt: "{:.0} GB livres de {:.0} GB", zh: "{:.0} GB 可用，共 {:.0} GB", gb(free), gb(total));
-                text(dc, &free_total, rc(bar.left, bar.bottom + sc(1), r.right - sc(8), y + hgt - sc(2)), pal().dim, DT_LEFT);
+                text(dc, &free_total, rc(bar.left, bar.bottom + sc(1), cr.right - sc(8), y + hgt - sc(2)), pal().dim, DT_LEFT);
             }
             y += hgt;
         }
@@ -1345,7 +1505,7 @@ unsafe fn paint_nav(hwnd: HWND) {
     fill(dc, rc(cr.right - 1, 0, cr.right, cr.bottom), pal().line, 0); // hairline between the pane and the list
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, of);
-    for f in [f_txt, f_head, f_glyph, f_small] { DeleteObject(f); }
+    for f in [f_txt, f_head, f_glyph, f_small, f_chev] { DeleteObject(f); }
     SelectObject(dc, old);
     DeleteObject(bmp);
     DeleteDC(dc);
@@ -1354,37 +1514,109 @@ unsafe fn paint_nav(hwnd: HWND) {
 }
 
 pub unsafe extern "system" fn nav_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let y = ((lp >> 16) & 0xFFFF) as i16 as i32;
+    let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
     match m {
         WM_PAINT => paint_nav(h),
         WM_ERASEBKGND => return 1,
         WM_TIMER if wp == 4 => { InvalidateRect(h, ptr::null(), 0); }
+        WM_SETCURSOR => {
+            // the right edge is the splitter between the pane and the list
+            let mut p: POINT = std::mem::zeroed();
+            let mut cr: RECT = std::mem::zeroed();
+            GetCursorPos(&mut p);
+            ScreenToClient(h, &mut p);
+            GetClientRect(h, &mut cr);
+            if p.x >= cr.right - sc(5) {
+                SetCursor(LoadCursorW(0 as _, IDC_SIZEWE));
+                return 1;
+            }
+            return DefWindowProcW(h, m, wp, lp);
+        }
         WM_MOUSEMOVE => {
-            let k = nav_hit(y).map_or(-1, |i| i as i32);
+            if let Some((sx, sw)) = NAV_DRAG.get() {
+                if GetKeyState(0x01) < 0 { // VK_LBUTTON
+                    let w = (sw + x - sx).clamp(180, 520);
+                    NAV_WIDTH.set(w);
+                    PostMessageW(GetParent(h), WM_UI, 56, 0);
+                    InvalidateRect(h, ptr::null(), 0);
+                    return 0;
+                }
+            }
+            let k = nav_row_at(y).map_or(-1, |i| i as i32);
             let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
             TrackMouseEvent(&mut tme);
             if NAVHOT.replace(k) != k { InvalidateRect(h, ptr::null(), 0); }
         }
         WM_MOUSELEAVE => { NAVHOT.set(-1); InvalidateRect(h, ptr::null(), 0); }
+        WM_MOUSEWHEEL => {
+            let d = (((wp >> 16) & 0xFFFF) as i16) as i32;
+            let content: i32 = NAV.with_borrow(|n| n.iter().map(nav_h).sum());
+            let mut cr: RECT = std::mem::zeroed();
+            GetClientRect(h, &mut cr);
+            let max = (content + sc(8) * 2 - cr.bottom).max(0);
+            let next = (NAV_SCROLL.get() - d.signum() * sc(48)).clamp(0, max);
+            NAV_SCROLL.set(next);
+            InvalidateRect(h, ptr::null(), 0);
+        }
         WM_RBUTTONUP => {
-            // a folder in the pane: pin / unpin it, or show its properties
-            if let Some(p) = nav_hit(y).and_then(nav_path) {
-                let menu = CreatePopupMenu();
-                let pin = if pins().contains(&p) { t!("Открепить от быстрого доступа", "Unpin from Quick access", ja: "クイック アクセスからピン留めを解除", pt: "Desafixar do Acesso rápido", zh: "从快速访问取消固定") } else { t!("Закрепить в быстром доступе", "Pin to Quick access", ja: "クイック アクセスにピン留め", pt: "Fixar no Acesso rápido", zh: "固定到快速访问") };
-                AppendMenuW(menu, MF_STRING, 1, w(pin).as_ptr());
-                AppendMenuW(menu, MF_STRING, 2, w(t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性")).as_ptr());
-                let mut pt: POINT = std::mem::zeroed();
-                GetCursorPos(&mut pt);
-                let id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
-                DestroyMenu(menu);
-                match id { 1 => toggle_pin(&p), 2 => crate::properties(&p), _ => {} }
+            let Some(i) = nav_row_at(y) else { return 0 };
+            let Some(p) = nav_path(i) else { return 0 };
+            let menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, 1, w(t!("Открыть в новой вкладке", "Open in new tab", ja: "新しいタブで開く", pt: "Abrir em nova guia", zh: "在新标签页中打开")).as_ptr());
+            AppendMenuW(menu, MF_STRING, 2, w(t!("Открыть в новом окне", "Open in new window", ja: "新しいウィンドウで開く", pt: "Abrir em nova janela", zh: "在新窗口中打开")).as_ptr());
+            AppendMenuW(menu, MF_STRING, 3, w(t!("Копировать путь", "Copy path", ja: "パスのコピー", pt: "Copiar caminho", zh: "复制路径")).as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            let pin = if pins().contains(&p) { t!("Открепить от быстрого доступа", "Unpin from Quick access", ja: "クイック アクセスからピン留めを解除", pt: "Desafixar do Acesso rápido", zh: "从快速访问取消固定") } else { t!("Закрепить в быстром доступе", "Pin to Quick access", ja: "クイック アクセスにピン留め", pt: "Fixar no Acesso rápido", zh: "固定到快速访问") };
+            AppendMenuW(menu, MF_STRING, 4, w(pin).as_ptr());
+            let expanded = NAV.with_borrow(|n| n.get(i).is_some_and(|it| it.expandable));
+            if expanded {
+                let lbl = if NAV.with_borrow(|n| n.get(i).is_some_and(|it| it.expanded)) { t!("Свернуть", "Collapse", ja: "折りたたむ", pt: "Recolher", zh: "折叠") } else { t!("Развернуть", "Expand", ja: "展開", pt: "Expandir", zh: "展开") };
+                AppendMenuW(menu, MF_STRING, 5, w(lbl).as_ptr());
+            }
+            AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            AppendMenuW(menu, MF_STRING, 6, w(t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性")).as_ptr());
+            let mut pt: POINT = std::mem::zeroed();
+            GetCursorPos(&mut pt);
+            let id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
+            DestroyMenu(menu);
+            let main = GetParent(h);
+            match id {
+                1 => { PostMessageW(main, WM_UI, 33, i as isize); }
+                2 => { PostMessageW(main, WM_UI, 34, i as isize); }
+                3 => { PostMessageW(main, WM_UI, 35, i as isize); }
+                4 => toggle_pin(&p),
+                5 => if NAV.with_borrow(|n| n.get(i).is_some_and(|it| it.expanded)) { collapse_node(h, i) } else { expand_node(h, i) },
+                6 => crate::properties(&p),
+                _ => {}
             }
         }
         WM_LBUTTONDOWN => {
-            if let Some(i) = nav_hit(y) {
-                PRESS.set((5000 + i as i32, now()));
-                InvalidateRect(h, ptr::null(), 0);
-                PostMessageW(GetParent(h), WM_UI, 20, i as isize);
+            let mut cr: RECT = std::mem::zeroed();
+            GetClientRect(h, &mut cr);
+            if x >= cr.right - sc(5) {
+                NAV_DRAG.set(Some((x, nav_width())));
+                SetCapture(h);
+                return 0;
+            }
+            match nav_node_at(x, y) {
+                Some((i, true)) => {
+                    if NAV.with_borrow(|n| n.get(i).is_some_and(|it| it.expanded)) { collapse_node(h, i) } else { expand_node(h, i) }
+                }
+                Some((i, false)) => {
+                    PRESS.set((5000 + i as i32, now()));
+                    InvalidateRect(h, ptr::null(), 0);
+                    if nav_path(i).is_some() { PostMessageW(GetParent(h), WM_UI, 20, i as isize); }
+                }
+                None => {}
+            }
+        }
+        WM_LBUTTONUP => {
+            if NAV_DRAG.take().is_some() {
+                ReleaseCapture();
+                if let Some(f) = nav_width_file() {
+                    if let Some(d) = f.parent() { let _ = fs::create_dir_all(d); }
+                    let _ = fs::write(f, nav_width().to_string());
+                }
             }
         }
         _ => return DefWindowProcW(h, m, wp, lp),

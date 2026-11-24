@@ -863,6 +863,7 @@ fn load(h: HWND, dir: PathBuf) {
     ui::set_search(None); // a folder again: the pill shows its path
     tab_text(tab, active, &label(&dir), false);
     ui::nav_dirty(); // the pane highlights where we are
+    if !desk() { ui::nav_sync(&dir); }
     reset_thumbs();
     put(list, LVM_DELETEALLITEMS, 0, 0);
     if desk() { desk::fill(list, n); } else { put(list, LVM_SETITEMCOUNT, n, 0); }
@@ -2183,6 +2184,20 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         31 => copy_tab_path(h, lp as usize),
                         _ => {}
                     },
+                    33 => { // a folder from the navigation pane: a new tab there
+                        if let Some(p) = ui::nav_path(lp as usize) {
+                            let (tab, active) = ST.with_borrow_mut(|st| { st.tabs.push(p.clone()); st.active = st.tabs.len() - 1; (st.tab, st.active) });
+                            tab_text(tab, active, "", true);
+                            load(h, p);
+                        }
+                    }
+                    34 => { if let Some(p) = ui::nav_path(lp as usize) { if let Ok(exe) = env::current_exe() { let _ = std::process::Command::new(exe).arg(p).spawn(); } } }
+                    35 => { if let Some(p) = ui::nav_path(lp as usize) { if !clip_text(&p.to_string_lossy()) { warn(h, "Cannot open the clipboard"); } } }
+                    56 => { // the pane splitter moved
+                        let mut r: RECT = std::mem::zeroed();
+                        GetClientRect(h, &mut r);
+                        ui::layout_children(r.right, r.bottom);
+                    }
                     40..=50 => match wp {
                         44 => select_all(h, false),
                         45 => select_all(h, true),
