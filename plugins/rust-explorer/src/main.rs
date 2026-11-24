@@ -708,21 +708,104 @@ pub fn drop_place_at(root: HWND, x: i32, y: i32) -> DropPlace {
     }
 }
 
-/// Right click on empty space: the folder's own menu.
+/// Right click on empty space: the folder's own menu, in the same Win11 look as the item menu.
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bg_menu(h: HWND) {
+    let mut pt: POINT = std::mem::zeroed();
+    GetCursorPos(&mut pt);
     if !desk() && cur_virtual() {
-        let m = CreatePopupMenu();
-        AppendMenuW(m, MF_STRING, 1, w(t!("Обновить", "Refresh", ja: "最新の情報に更新", pt: "Atualizar", zh: "刷新")).as_ptr());
+        let mut items = vec![ctxmenu::Item { id: 1, text: t!("Обновить", "Refresh", ja: "最新の情報に更新", pt: "Atualizar", zh: "刷新").into(), glyph: "\u{E72C}", ..Default::default() }];
         if cur_dir().to_string_lossy() == "::recycle" {
-            AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
-            AppendMenuW(m, MF_STRING, 2, w(t!("Очистить корзину", "Empty Recycle Bin", ja: "ごみ箱を空にする", pt: "Esvaziar Lixeira", zh: "清空回收站")).as_ptr());
+            items.push(ctxmenu::Item::separator());
+            items.push(ctxmenu::Item { id: 2, text: t!("Очистить корзину", "Empty Recycle Bin", ja: "ごみ箱を空にする", pt: "Esvaziar Lixeira", zh: "清空回收站").into(), glyph: "\u{E74D}", ..Default::default() });
         }
-        let mut pt: POINT = std::mem::zeroed();
-        GetCursorPos(&mut pt);
-        let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
-        DestroyMenu(m);
-        match id { 1 => reload(h), 2 => recycle_empty(h), _ => {} }
+        match ctxmenu::show(h, items, (pt.x, pt.y)) {
+            ctxmenu::Pick::Id(1) => reload(h),
+            ctxmenu::Pick::Id(2) => recycle_empty(h),
+            _ => {}
+        }
+        return;
+    }
+    let disk = tool("wiztree");
+    if !desk() {
+        let action = |id: u32, text: &str, glyph: &'static str| ctxmenu::Item { id, text: text.into(), glyph, ..Default::default() };
+        let check = |id: u32, text: &str, on: bool| ctxmenu::Item { id, text: text.into(), checked: on, ..Default::default() };
+        let radio = |id: u32, text: &str, on: bool| ctxmenu::Item { id, text: text.into(), radio: true, checked: on, ..Default::default() };
+        let sub = |text: &str, glyph: &'static str, items: Vec<ctxmenu::Item>| ctxmenu::Item { text: text.into(), glyph, sub: items, ..Default::default() };
+        let checks = {
+            let list = ST.with_borrow(|st| st.list);
+            SendMessageW(list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) as isize & LVS_EX_CHECKBOXES as isize != 0
+        };
+        let show = vec![
+            check(93, t!("Флажки элементов", "Item check boxes", ja: "項目のチェック ボックス", pt: "Caixas de seleção de itens", zh: "项目复选框"), checks),
+            check(94, t!("Расширения имён файлов", "File name extensions", ja: "ファイル名拡張子", pt: "Extensões de nome de arquivo", zh: "文件扩展名"), SHOW_EXT.load(Relaxed)),
+            check(95, t!("Скрытые элементы", "Hidden items", ja: "隠しファイル", pt: "Itens ocultos", zh: "隐藏的项目"), SHOW_HIDDEN.load(Relaxed)),
+            check(96, t!("Компактный вид", "Compact view", ja: "コンパクト表示", pt: "Exibição compacta", zh: "紧凑视图"), COMPACT.load(Relaxed)),
+        ];
+        let view = ST.with_borrow(|st| st.view);
+        let modes = [
+            (80u32, ViewMode::ExtraLarge, t!("Очень крупные значки", "Extra large icons", ja: "特大アイコン", pt: "Ícones extragrandes", zh: "超大图标")),
+            (81, ViewMode::Large, t!("Крупные значки", "Large icons", ja: "大アイコン", pt: "Ícones grandes", zh: "大图标")),
+            (82, ViewMode::Medium, t!("Обычные значки", "Medium icons", ja: "中アイコン", pt: "Ícones médios", zh: "中等图标")),
+            (83, ViewMode::Small, t!("Мелкие значки", "Small icons", ja: "小アイコン", pt: "Ícones pequenos", zh: "小图标")),
+            (84, ViewMode::List, t!("Список", "List", ja: "一覧", pt: "Lista", zh: "列表")),
+            (85, ViewMode::Details, t!("Таблица", "Details", ja: "詳細", pt: "Detalhes", zh: "详细信息")),
+            (86, ViewMode::Tiles, t!("Плитка", "Tiles", ja: "タイル", pt: "Blocos", zh: "平铺")),
+        ];
+        let mut views: Vec<ctxmenu::Item> = modes.iter().map(|(id, m, label)| radio(*id, label, view == *m)).collect();
+        views.push(ctxmenu::Item::separator());
+        views.push(sub(t!("Показать", "Show", ja: "表示", pt: "Mostrar", zh: "显示"), "\u{E7B3}", show));
+        let (col, asc) = (SORT_COL.load(Relaxed) as u32, SORT_ASC.load(Relaxed));
+        let sorts = vec![
+            radio(60, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称"), col == 0),
+            radio(62, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期"), col == 1),
+            radio(64, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型"), col == 2),
+            radio(66, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"), col == 3),
+            ctxmenu::Item::separator(),
+            radio(75, t!("По возрастанию", "Ascending", ja: "昇順", pt: "Crescente", zh: "递增"), asc),
+            radio(76, t!("По убыванию", "Descending", ja: "降順", pt: "Decrescente", zh: "递减"), !asc),
+        ];
+        let g = GROUP.load(Relaxed);
+        let groups = vec![
+            radio(70, t!("Нет", "(None)", ja: "なし", pt: "(Nenhum)", zh: "(无)"), g == 0),
+            radio(71, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称"), g == 2),
+            radio(72, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期"), g == 1),
+            radio(73, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型"), g == 3),
+            radio(74, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"), g == 4),
+        ];
+        let new = vec![
+            action(15, t!("Папка", "Folder", ja: "フォルダー", pt: "Pasta", zh: "文件夹"), ""),
+            action(18, t!("Текстовый документ", "Text document", ja: "テキスト ドキュメント", pt: "Documento de texto", zh: "文本文档"), ""),
+            action(19, t!("Сжатая ZIP-папка", "Compressed (zipped) folder", ja: "圧縮 (zip 形式) フォルダー", pt: "Pasta compactada (zip)", zh: "压缩(zipped)文件夹"), ""),
+        ];
+        let paste_on = windows_sys::Win32::System::DataExchange::IsClipboardFormatAvailable(15) != 0; // CF_HDROP
+        let mut items = vec![
+            sub(t!("Просмотр", "View", ja: "表示", pt: "Exibir", zh: "查看"), "\u{E890}", views),
+            sub(t!("Сортировка", "Sort by", ja: "並べ替え", pt: "Classificar por", zh: "排序方式"), "\u{E8CB}", sorts),
+            sub(t!("Группировать", "Group by", ja: "グループ化", pt: "Agrupar por", zh: "分组依据"), "\u{E8FD}", groups),
+            ctxmenu::Item::separator(),
+            action(7, t!("Обновить", "Refresh", ja: "最新の情報に更新", pt: "Atualizar", zh: "刷新"), "\u{E72C}"),
+            ctxmenu::Item { id: 12, text: t!("Вставить", "Paste", ja: "貼り付け", pt: "Colar", zh: "粘贴").into(), glyph: "\u{E77F}", disabled: !paste_on, ..Default::default() },
+            sub(t!("Создать", "New", ja: "新規作成", pt: "Novo", zh: "新建"), "\u{E710}", new),
+            ctxmenu::Item::separator(),
+        ];
+        if disk.is_some() {
+            items.push(action(6, t!("Занятое место (WinRust Disk)", "Disk usage (WinRust Disk)", ja: "ディスク使用量 (WinRust Disk)", pt: "Uso do disco (WinRust Disk)", zh: "磁盘占用（WinRust Disk）"), "\u{EDA2}"));
+        }
+        items.push(action(5, t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性"), "\u{E713}"));
+        match ctxmenu::show(h, items, (pt.x, pt.y)) {
+            ctxmenu::Pick::Id(5) => properties(&cur_dir()),
+            ctxmenu::Pick::Id(6) => { // wiztree takes the drive letter and asks for admin rights itself
+                let dir = cur_dir();
+                let drive: String = dir.to_string_lossy().chars().take(2).collect();
+                if let Some(exe) = disk { let _ = std::process::Command::new(exe).arg(drive).spawn(); }
+            }
+            ctxmenu::Pick::Id(id) => {
+                let id = match id { 75 => 60 + col * 2, 76 => 61 + col * 2, x => x }; // "ascending / descending": the sorted column too
+                PostMessageW(h, ui::WM_UI, id as usize, 0);
+            }
+            ctxmenu::Pick::None => {}
+        }
         return;
     }
     let m = CreatePopupMenu();
@@ -734,7 +817,6 @@ unsafe fn bg_menu(h: HWND) {
         (5, t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性")),
     ];
     for (id, lbl) in items { AppendMenuW(m, MF_STRING, id, w(lbl).as_ptr()); }
-    let disk = tool("wiztree");
     if disk.is_some() { AppendMenuW(m, MF_STRING, 6, w(t!("Занятое место (WinRust Disk)", "Disk usage (WinRust Disk)", ja: "ディスク使用量 (WinRust Disk)", pt: "Uso do disco (WinRust Disk)", zh: "磁盘占用（WinRust Disk）")).as_ptr()); }
     if desk() {
         let sort = [
@@ -757,8 +839,6 @@ unsafe fn bg_menu(h: HWND) {
         let lbl = if icons_hidden() { t!("Показать значки рабочего стола", "Show desktop icons", ja: "デスクトップ アイコンを表示", pt: "Mostrar ícones da área de trabalho", zh: "显示桌面图标") } else { t!("Скрыть значки рабочего стола", "Hide desktop icons", ja: "デスクトップ アイコンを非表示", pt: "Ocultar ícones da área de trabalho", zh: "隐藏桌面图标") };
         AppendMenuW(m, MF_STRING, 7, w(lbl).as_ptr());
     }
-    let mut pt: POINT = std::mem::zeroed();
-    GetCursorPos(&mut pt);
     let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
     DestroyMenu(m);
     let dir = cur_dir();
@@ -2634,6 +2714,29 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_THEMECHANGED if !desk() => { ui::theme_invalidate(); ui::restyle(h); 0 }
             // mouse buttons 4 / 5 (and keyboard media keys) arrive as APPCOMMAND_BROWSER_BACKWARD / _FORWARD
             0x0319 if !desk() && matches!((lp >> 16) & 0x7FF, 1 | 2) => { nav(h, (lp >> 16) & 0x7FF == 1); 1 }
+            // the caption is ours (the tab row): no band at the top at all — restored, the client starts at the window edge;
+            // maximized, it is the work area itself. The top edge stays resizable through the chrome's hit test.
+            WM_NCCALCSIZE if !desk() && wp != 0 => {
+                let p = lp as *mut NCCALCSIZE_PARAMS;
+                if IsZoomed(h) != 0 {
+                    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+                    let mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+                    let mut mi: MONITORINFO = std::mem::zeroed();
+                    mi.cbSize = size_of::<MONITORINFO>() as u32;
+                    if GetMonitorInfoW(mon, &mut mi) != 0 { (*p).rgrc[0] = mi.rcWork; return 0; }
+                }
+                let top = (*p).rgrc[0].top;
+                let r = DefWindowProcW(h, m, wp, lp);
+                (*p).rgrc[0].top = top;
+                r
+            }
+            // the window has no title bar: the top edge is client, so the parent answers the chrome's pass-through there
+            WM_NCHITTEST if !desk() => {
+                let mut c = POINT { x: (lp & 0xffff) as u16 as i16 as i32, y: ((lp >> 16) & 0xffff) as u16 as i16 as i32 };
+                ScreenToClient(h, &mut c);
+                if c.y >= 0 && c.y < ui::sc(5) { return HTTOP as LRESULT; }
+                DefWindowProcW(h, m, wp, lp)
+            }
             WM_SIZE => {
                 let list = ST.with_borrow(|st| st.list);
                 let (cw, ch) = ((lp & 0xFFFF) as i32, ((lp >> 16) & 0xFFFF) as i32);
@@ -3131,7 +3234,7 @@ fn main() {
         // desktop without a wallpaper file shows black, not window white
         // desktop: COLOR_BACKGROUND, the user's solid colour when there is no picture, never black (#108, #111)
         let bg = if desktop { windows_sys::Win32::Graphics::Gdi::GetSysColorBrush(1) as _ } else { windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(ui::pal().bg) };
-        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(ui::proc), hInstance: inst, lpszClassName: w("RxChrome").as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), ..std::mem::zeroed() });
+        RegisterClassW(&WNDCLASSW { style: CS_DBLCLKS, lpfnWndProc: Some(ui::proc), hInstance: inst, lpszClassName: w("RxChrome").as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), ..std::mem::zeroed() });
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(ui::nav_proc), hInstance: inst, lpszClassName: w("RxNav").as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), ..std::mem::zeroed() });
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(proc), hInstance: inst, lpszClassName: cls.as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), hIcon: LoadIconW(inst, 1 as _), hbrBackground: bg, ..std::mem::zeroed() });
         if desktop {
@@ -3148,6 +3251,7 @@ fn main() {
             SetWindowPos(d, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         } else {
             // where it was last closed, maximized again if it was (#71); a first start gets the default size
+            // Windows puts WS_CAPTION back on a thick-framed window; WM_NCCALCSIZE below hands the caption area to the client
             let win = CreateWindowExW(0, cls.as_ptr(), ptr::null(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, ui::sc(1100), ui::sc(700), 0 as _, 0 as _, inst, ptr::null());
             match saved_place() {
                 // the same API that saved it: rcNormalPosition is in work-area coordinates, which CreateWindow does not use

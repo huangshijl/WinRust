@@ -53,24 +53,24 @@ impl Item {
     }
 }
 
-const ROW_H: i32 = 30;
-const SEP_H: i32 = 9;
-const PAD_X: i32 = 10;
-const PAD_Y: i32 = 5;
+const ROW_H: i32 = 32;
+const SEP_H: i32 = 11;
+const PAD_X: i32 = 12;
+const PAD_Y: i32 = 6;
 const ICON_W: i32 = 20;
-const ICON_GAP: i32 = 10;
-const ARROW_W: i32 = 22;
-const MIN_COL: i32 = 210;
-const MAX_COL: i32 = 400;
+const ICON_GAP: i32 = 12;
+const ARROW_W: i32 = 24;
+const MIN_COL: i32 = 220;
+const MAX_COL: i32 = 440;
 const RADIUS: i32 = 8;
 const CLASS: &str = "WinRustCtxMenu";
 
 
-struct Fonts { txt: isize, bold: isize, glyph: isize, small: isize, dc: HDC }
+struct Fonts { txt: isize, bold: isize, glyph: isize, small: isize, arrow: isize, dc: HDC }
 impl Drop for Fonts {
     fn drop(&mut self) {
         unsafe {
-            for f in [self.txt, self.bold, self.glyph, self.small] { if f != 0 { DeleteObject(f as HGDIOBJ); } }
+            for f in [self.txt, self.bold, self.glyph, self.small, self.arrow] { if f != 0 { DeleteObject(f as HGDIOBJ); } }
             ReleaseDC(ptr::null_mut(), self.dc);
         }
     }
@@ -172,7 +172,7 @@ impl State {
         }
         self.hot = Some((col, row));
         self.rebuild();
-        let changed = prev.map_or(true, |(b, p, s)| b != self.base || p != self.path || s != self.show);
+        let changed = prev.as_ref().map_or(true, |(b, p, s)| *b != self.base || *p != self.path || *s != self.show);
         if changed { self.layout(); }
     }
 
@@ -307,7 +307,7 @@ impl State {
     fn open_current(&mut self) -> bool {
         let Some((col, row)) = self.hot else { return false };
         let Some(it) = self.cols.get(col).and_then(|c| c.items.get(row)) else { return false };
-        if it.sep || it.disabled || it.id == 0 || it.id == u32::MAX { return false; }
+        if it.sep || it.disabled || (it.id == 0 && !it.submenu()) || it.id == u32::MAX { return false; }
         if it.submenu() {
             if col < self.show {
                 self.root_hover(col, row);
@@ -390,6 +390,7 @@ impl State {
         let nw = x.max(1);
         let nh = geom.iter().map(|c| c.h).max().unwrap_or(1).max(2 * self.pad_y + self.row_h);
         self.geom = geom;
+        if self.menu.is_null() { return; }
         unsafe {
             let mut r = RECT::default();
             GetWindowRect(self.menu, &mut r);
@@ -398,6 +399,14 @@ impl State {
                 let rg = CreateRoundRectRgn(0, 0, nw + 1, nh + 1, self.radius * 2, self.radius * 2);
                 SetWindowRgn(self.menu, rg, 1);
             }
+            // the card grows to the right as submenus open: slide it back inside the monitor when it would run off
+            GetWindowRect(self.menu, &mut r);
+            let m = ui::sc(8);
+            let work = work_rect(POINT { x: r.left + 3, y: r.top + 3 });
+            let (w, h) = (r.right - r.left, r.bottom - r.top);
+            let nx = if r.right > work.right - m { (work.right - m - w).max(work.left + m) } else { r.left };
+            let ny = if r.bottom > work.bottom - m { (work.bottom - m - h).max(work.top + m) } else { r.top };
+            if nx != r.left || ny != r.top { SetWindowPos(self.menu, ptr::null_mut(), nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE); }
             InvalidateRect(self.menu, ptr::null(), 0);
         }
     }
@@ -446,17 +455,11 @@ impl State {
             let owners: Vec<(usize, usize)> = self.cols.iter().filter_map(|c| c.owner).collect();
             for (ci, col) in self.cols.iter().enumerate() {
                 let g = &self.geom[ci];
-                if ci > 0 {
-                    let line = CreateSolidBrush(p.line);
-                    let lr = RECT { left: g.x, top: self.pad_y, right: g.x + 1, bottom: g.h - self.pad_y };
-                    FillRect(mem, &lr, line);
-                    DeleteObject(line as HGDIOBJ);
-                }
                 for &(y, h, ri) in &g.rows {
                     let it = &col.items[ri];
-                    let rr = RECT { left: g.x + 3, top: y + 1, right: g.x + g.w - 3, bottom: y + h - 1 };
+                    let rr = RECT { left: g.x + 4, top: y + 1, right: g.x + g.w - 4, bottom: y + h - 1 };
                     if it.sep {
-                        let line = CreateSolidBrush(p.line);
+                        let line = CreateSolidBrush(p.pill_line);
                         let lr = RECT { left: g.x + self.pad_x, top: y + h / 2, right: g.x + g.w - self.pad_x, bottom: y + h / 2 + 1 };
                         FillRect(mem, &lr, line);
                         DeleteObject(line as HGDIOBJ);
@@ -464,18 +467,15 @@ impl State {
                     }
                     let hot = self.hot == Some((ci, ri));
                     let owns = owners.contains(&(ci, ri));
-                    if hot {
+                    if hot || owns {
                         let hover = if p.hover == p.card { 0x00E8E8E8 } else { p.hover };
-                        ui::fill(mem, rr, hover, ui::sc(5));
-                    } else if owns {
-                        let tint = ui::mix(p.card, p.hover, 0.55);
-                        ui::fill(mem, rr, tint, ui::sc(5));
+                        ui::fill(mem, rr, if hot { hover } else { ui::mix(p.card, hover, 0.7) }, ui::sc(6));
                     }
                     let text_c = if it.disabled { ui::off() } else { p.text };
                     let mut x = g.x + self.pad_x;
-                    // a check / radio mark takes the place of the icon
+                    // a check / radio mark takes the place of the icon (radio: the mode this menu is on)
                     let ix = x + (self.gutter - self.pad_x) / 2;
-                    if it.checked || it.radio {
+                    if it.checked {
                         SelectObject(mem, self.fonts.glyph as HGDIOBJ);
                         ui::text(mem, if it.radio { "\u{25CF}" } else { "\u{E73E}" }, RECT { left: g.x, top: y, right: g.x + self.gutter - self.pad_x / 2, bottom: y + h }, if it.disabled { ui::off() } else { p.accent }, DT_CENTER | DT_VCENTER);
                     } else if it.hbmp != 0 {
@@ -494,11 +494,20 @@ impl State {
                     SelectObject(mem, (if it.default { self.fonts.bold } else { self.fonts.txt }) as HGDIOBJ);
                     ui::text(mem, &it.text, RECT { left: x, top: y, right: right - if it.hint.is_empty() { 0 } else { self.text_w(self.fonts.small, &it.hint) + 12 }, bottom: y + h }, text_c, DT_LEFT | DT_VCENTER);
                     if it.submenu() {
-                        SelectObject(mem, self.fonts.glyph as HGDIOBJ);
-                        ui::text(mem, "\u{E76C}", RECT { left: g.x + g.w - self.arrow, top: y, right: g.x + g.w - 4, bottom: y + h }, if it.disabled { ui::off() } else { p.dim }, DT_CENTER | DT_VCENTER);
+                        SelectObject(mem, self.fonts.arrow as HGDIOBJ);
+                        ui::text(mem, "\u{E76C}", RECT { left: g.x + g.w - self.arrow, top: y, right: g.x + g.w - 6, bottom: y + h }, if it.disabled { ui::off() } else { p.dim }, DT_CENTER | DT_VCENTER);
                     }
                 }
             }
+            // the outline: without it the card melts into a light list behind it
+            let border = ui::mix(p.pill_line, p.text, 0.14);
+            let pen = CreatePen(PS_SOLID, 1, border);
+            let o_pen = SelectObject(mem, pen as HGDIOBJ);
+            let o_brush = SelectObject(mem, GetStockObject(NULL_BRUSH) as HGDIOBJ);
+            RoundRect(mem, 0, 0, wd, ht, self.radius * 2, self.radius * 2);
+            SelectObject(mem, o_brush);
+            SelectObject(mem, o_pen);
+            DeleteObject(pen as HGDIOBJ);
             BitBlt(dc, 0, 0, wd, ht, mem, 0, 0, SRCCOPY);
             SelectObject(mem, old);
             DeleteObject(buf as HGDIOBJ);
@@ -527,11 +536,15 @@ unsafe fn draw_bmp(dc: HDC, it: &Item, x: i32, y: i32, alpha: u8) {
 
 // ---------- window ----------
 
-/// While the menu is up the parent window keeps the focus: keys are taken here, as a real menu does.
+/// While the menu is up the parent window keeps the focus: keys are taken here, as a real menu does. Any click that is not
+/// on the menu closes it, wherever capture ended up (a click into another window can take the capture away).
 unsafe extern "system" fn hook_proc(code: i32, wp: usize, lp: isize) -> isize {
     if code == 0 {
         let msg = &*(lp as *const MSG);
+        let menu = MENU_H.with(|c| c.get()) as HWND;
         if msg.message == WM_ACTIVATEAPP && msg.wParam == 0 {
+            done(Pick::None);
+        } else if matches!(msg.message, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_NCLBUTTONDOWN | WM_NCRBUTTONDOWN) && menu != std::ptr::null_mut() && msg.hwnd != menu {
             done(Pick::None);
         } else if msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN {
             let open = STATE.with_borrow(|s| s.is_some());
@@ -657,10 +670,11 @@ unsafe fn show_inner(parent: HWND, items: Vec<Item>, at: POINT) -> Pick {
     DONE.with(|d| d.set(None));
     let dc = GetDC(ptr::null_mut());
     let fonts = Fonts {
-        txt: ui::font(13, 400, ui::ui_face()),
-        bold: ui::font(13, 600, ui::ui_face()),
+        txt: ui::font(14, 400, ui::ui_face()),
+        bold: ui::font(14, 600, ui::ui_face()),
         glyph: ui::font(16, 400, winrust_common::style::icon_face()),
         small: ui::font(12, 400, ui::ui_face()),
+        arrow: ui::font(11, 400, winrust_common::style::icon_face()),
         dc,
     };
     let row_h = ui::sc(ROW_H);
@@ -689,17 +703,10 @@ unsafe fn show_inner(parent: HWND, items: Vec<Item>, at: POINT) -> Pick {
     };
     st.show = st.chunks.len();
     st.rebuild();
-    // one measure pass to know the size before the window exists
-    let tmp = st.cols.iter().map(|c| st.col_width(&c.items)).sum::<i32>().max(ui::sc(MIN_COL));
-    let widest_sub = |cols: &[Col], st: &State| cols.iter().map(|c| st.col_width(&c.items)).max().unwrap_or(ui::sc(MIN_COL));
-    let wmax = (tmp + 3 * widest_sub(&st.cols, &st)).min(work.right - work.left - 2 * margin);
-    let hmax = tallest.max(row_h + 2 * pad_y).min(max_h);
-    let mut x = at.x;
-    if x + wmax > work.right - margin { x = work.right - margin - wmax; }
-    if x < work.left + margin { x = work.left + margin; }
-    let mut y = at.y;
-    if y + hmax > work.bottom - margin { y = (work.bottom - margin - hmax).max(work.top + margin); }
-    if y < work.top + margin { y = work.top + margin; }
+    // anchored at the click / button corner; layout() slides the card inside the monitor once its real size is known
+    let x = at.x.clamp(work.left + margin, (work.right - margin - row_h).max(work.left + margin));
+    let y = at.y.clamp(work.top + margin, (work.bottom - margin - row_h).max(work.top + margin));
+    let _ = (tallest, max_h);
 
     register_class();
     let menu = CreateWindowExW(

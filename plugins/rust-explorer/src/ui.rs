@@ -75,6 +75,11 @@ const VIEW: i32 = 31;
 const MORE: i32 = 33;
 const SEARCH_BOX: i32 = 34;
 const SEARCH_CLEAR: i32 = 35;
+const WMIN: i32 = 41; // window buttons, in the tab row (which is the title bar: the window has no caption)
+const WMAX: i32 = 42;
+const WCLOSE: i32 = 43;
+/// The tab row doubles as the title bar: an empty spot drags the window, the buttons sit at its right.
+const TITLE_H: i32 = 40;
 const TAB: i32 = 100; // + index
 const CLOSE: i32 = 200; // + index
 const CRUMB: i32 = 400; // + index: a part of the path in the address pill
@@ -473,7 +478,7 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
 
 // ---------- layout and hit testing ----------
 
-struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, back: RECT, fwd: RECT, up: RECT, reload: RECT, pill: RECT, search: RECT, search_clear: RECT, new: RECT, new_more: RECT, cut: RECT, copy: RECT, paste: RECT, paste_more: RECT, rename: RECT, delete: RECT, share: RECT, sort: RECT, view: RECT, more: RECT, labels: bool, seps: Vec<i32> }
+struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, back: RECT, fwd: RECT, up: RECT, reload: RECT, pill: RECT, search: RECT, search_clear: RECT, new: RECT, new_more: RECT, cut: RECT, copy: RECT, paste: RECT, paste_more: RECT, rename: RECT, delete: RECT, share: RECT, sort: RECT, view: RECT, more: RECT, wmin: RECT, wmax: RECT, wclose: RECT, labels: bool, seps: Vec<i32> }
 
 fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT { RECT { left: l, top: t, right: r, bottom: b } }
 
@@ -495,12 +500,15 @@ fn label_w(s: &str) -> i32 {
     }))
 }
 
-/// The Win11 three-row chrome: tabs, navigation + address + search, command bar.
+/// The Win11 three-row chrome: the tab row (also the title bar, with the window buttons), navigation + address + search,
+/// command bar.
 fn layout(cw: i32, n: usize) -> Layout {
     let pad = sc(8);
+    let tbtn = sc(46);
+    let (wmin, wmax, wclose) = (rc((cw - tbtn * 3).max(0), 0, (cw - tbtn * 2).max(0), sc(TITLE_H)), rc((cw - tbtn * 2).max(0), 0, (cw - tbtn).max(0), sc(TITLE_H)), rc((cw - tbtn).max(0), 0, cw, sc(TITLE_H)));
     let (ty0, ty1) = (sc(5), sc(37));
     let plus_w = sc(28);
-    let avail = (cw - pad * 2 - plus_w - sc(6)).max(sc(120));
+    let avail = (cw - pad * 2 - plus_w - sc(6) - tbtn * 3 - sc(6)).max(sc(120));
     let tw = (avail / n.max(1) as i32).clamp(sc(110), sc(240));
     let tabs: Vec<RECT> = (0..n as i32).map(|i| { let l = pad + i * (tw + sc(4)); rc(l, ty0, l + tw, ty1) }).collect();
     let close = tabs.iter().map(|t| rc(t.right - sc(26), (t.top + t.bottom) / 2 - sc(9), t.right - sc(8), (t.top + t.bottom) / 2 + sc(9))).collect();
@@ -556,12 +564,15 @@ fn layout(cw: i32, n: usize) -> Layout {
     let sort = rc(view.left - sc(2) - sort_w, cy0, view.left - sc(2), cy1);
     let _ = x;
 
-    Layout { tabs, close, plus, back: nav(0), fwd: nav(1), up: nav(2), reload, pill, search, search_clear, new, new_more, cut, copy, paste, paste_more, rename, delete, share, sort, view, more, labels, seps }
+    Layout { tabs, close, plus, back: nav(0), fwd: nav(1), up: nav(2), reload, pill, search, search_clear, new, new_more, cut, copy, paste, paste_more, rename, delete, share, sort, view, more, wmin, wmax, wclose, labels, seps }
 }
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool { x >= r.left && x < r.right && y >= r.top && y < r.bottom }
 
 fn hit(l: &Layout, x: i32, y: i32) -> i32 {
+    for (k, r) in [(WMIN, &l.wmin), (WMAX, &l.wmax), (WCLOSE, &l.wclose)] {
+        if inside(r, x, y) { return k; }
+    }
     for (i, c) in l.close.iter().enumerate() { if inside(c, x, y) { return CLOSE + i as i32; } }
     for (i, t) in l.tabs.iter().enumerate() { if inside(t, x, y) { return TAB + i as i32; } }
     for (k, r) in [(BACK, &l.back), (FWD, &l.fwd), (UP, &l.up), (RELOAD, &l.reload), (PLUS, &l.plus)] {
@@ -720,6 +731,20 @@ unsafe fn paint_chrome(hwnd: HWND) {
         let to = TAB_DROP.get().min(l.tabs.len());
         let x = if to < l.tabs.len() { l.tabs[to].left - sc(2) } else { l.tabs.last().map_or(sc(8), |t| t.right + sc(2)) };
         fill(dc, rc(x, sc(4), x + sc(2), sc(38)), pal().accent, 1); // where the tab will land
+    }
+
+    // window buttons: the tab row is the title bar
+    let zoomed = IsZoomed(GetParent(hwnd)) != 0;
+    for (k, r, g) in [(WMIN, l.wmin, "\u{E921}"), (WMAX, l.wmax, if zoomed { "\u{E923}" } else { "\u{E922}" }), (WCLOSE, l.wclose, "\u{E8BB}")] {
+        let e = hv(k, hot == k);
+        SelectObject(dc, f_small);
+        if k == WCLOSE {
+            if e > 0.01 { fill(dc, r, mix(pal().bg, 0x00C42B1C, e), 0); }
+            text(dc, g, r, mix(pal().text, 0x00FFFFFF, e), DT_CENTER);
+        } else {
+            if e > 0.01 { fill(dc, r, mix(pal().bg, pal().hover, e), 0); }
+            text(dc, g, r, pal().text, DT_CENTER);
+        }
     }
 
     // navigation buttons
@@ -887,62 +912,59 @@ pub unsafe fn status_dirty(h: HWND) {
 
 // ---------- chrome window ----------
 
-// ---------- command-bar dropdowns (native menus for now; the multi-column menu comes in P4) ----------
+// ---------- chrome dropdowns (the same Win11 menu as the right click) ----------
 
-/// (id, label, enabled, checked)
-unsafe fn popup_at(h: HWND, at: RECT, items: &[(u32, String, bool, bool)]) -> u32 {
-    let m = CreatePopupMenu();
-    for (id, label, enabled, checked) in items {
-        let flags = MF_STRING | if *enabled { 0 } else { MF_GRAYED } | if *checked { MF_CHECKED } else { 0 };
-        AppendMenuW(m, flags, *id as usize, w(label).as_ptr());
-    }
+fn mi(id: u32, label: &str) -> ctxmenu::Item { ctxmenu::Item { id, text: label.into(), ..Default::default() } }
+fn moff(id: u32, label: &str) -> ctxmenu::Item { ctxmenu::Item { id, text: label.into(), disabled: true, ..Default::default() } }
+fn mcheck(id: u32, label: &str, on: bool) -> ctxmenu::Item { ctxmenu::Item { id, text: label.into(), checked: on, ..Default::default() } }
+fn mradio(id: u32, label: &str, on: bool) -> ctxmenu::Item { ctxmenu::Item { id, text: label.into(), radio: true, checked: on, ..Default::default() } }
+
+/// Shows a dropdown just under `at` (chrome coordinates); the picked command reaches the window as WM_UI.
+unsafe fn dropdown(h: HWND, at: RECT, items: Vec<ctxmenu::Item>) -> u32 {
     let mut pt = POINT { x: at.left, y: at.bottom + sc(2) };
     ClientToScreen(h, &mut pt);
-    let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, h, ptr::null());
-    DestroyMenu(m);
-    id as u32
+    match ctxmenu::show(GetParent(h), items, (pt.x, pt.y)) { ctxmenu::Pick::Id(id) => id, ctxmenu::Pick::None => 0 }
 }
 
 unsafe fn new_menu(h: HWND, at: RECT) {
-    let items = [
-        (15u32, t!("Папка", "Folder", ja: "フォルダー", pt: "Pasta", zh: "文件夹").to_string(), true, false),
-        (42, t!("Ярлык", "Shortcut", ja: "ショートカット", pt: "Atalho", zh: "快捷方式").to_string(), false, false),
-        (18, t!("Текстовый документ", "Text document", ja: "テキスト ドキュメント", pt: "Documento de texto", zh: "文本文档").to_string(), true, false),
-        (43, t!("Точечный рисунок", "Bitmap image", ja: "ビットマップ イメージ", pt: "Imagem de bitmap", zh: "位图图像").to_string(), false, false),
-        (19, t!("Сжатая ZIP-папка", "Compressed (zipped) folder", ja: "圧縮 (zip 形式) フォルダー", pt: "Pasta compactada (zip)", zh: "压缩(zipped)文件夹").to_string(), true, false),
+    let items = vec![
+        mi(15, t!("Папка", "Folder", ja: "フォルダー", pt: "Pasta", zh: "文件夹")),
+        moff(42, t!("Ярлык", "Shortcut", ja: "ショートカット", pt: "Atalho", zh: "快捷方式")),
+        mi(18, t!("Текстовый документ", "Text document", ja: "テキスト ドキュメント", pt: "Documento de texto", zh: "文本文档")),
+        moff(43, t!("Точечный рисунок", "Bitmap image", ja: "ビットマップ イメージ", pt: "Imagem de bitmap", zh: "位图图像")),
+        mi(19, t!("Сжатая ZIP-папка", "Compressed (zipped) folder", ja: "圧縮 (zip 形式) フォルダー", pt: "Pasta compactada (zip)", zh: "压缩(zipped)文件夹")),
     ];
-    let id = popup_at(h, at, &items);
+    let id = dropdown(h, at, items);
     if id != 0 { PostMessageW(GetParent(h), WM_UI, id as usize, 0); }
 }
 
 unsafe fn paste_menu(h: HWND, at: RECT) {
-    let items = [
-        (12u32, t!("Вставить", "Paste", ja: "貼り付け", pt: "Colar", zh: "粘贴").to_string(), true, false),
-        (41, t!("Вставить ярлык", "Paste shortcut", ja: "ショートカットの貼り付け", pt: "Colar atalho", zh: "粘贴快捷方式").to_string(), false, false),
-    ];
-    let id = popup_at(h, at, &items);
+    let mut paste = mi(12, t!("Вставить", "Paste", ja: "貼り付け", pt: "Colar", zh: "粘贴"));
+    paste.glyph = "\u{E77F}";
+    let items = vec![paste, moff(41, t!("Вставить ярлык", "Paste shortcut", ja: "ショートカットの貼り付け", pt: "Colar atalho", zh: "粘贴快捷方式"))];
+    let id = dropdown(h, at, items);
     if id != 0 { PostMessageW(GetParent(h), WM_UI, id as usize, 0); }
 }
 
 unsafe fn sort_menu(h: HWND, at: RECT) {
     let col = SORT_COL.load(Relaxed);
     let asc = SORT_ASC.load(Relaxed);
-    let items = [
-        (60u32, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称").to_string(), true, col == 0),
-        (62, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期").to_string(), true, col == 1),
-        (64, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型").to_string(), true, col == 2),
-        (66, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小").to_string(), true, col == 3),
-        (75, t!("По возрастанию", "Ascending", ja: "昇順", pt: "Crescente", zh: "递增").to_string(), true, asc),
-        (76, t!("По убыванию", "Descending", ja: "降順", pt: "Decrescente", zh: "递减").to_string(), true, !asc),
+    let items = vec![
+        mradio(60, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称"), col == 0),
+        mradio(62, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期"), col == 1),
+        mradio(64, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型"), col == 2),
+        mradio(66, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"), col == 3),
+        ctxmenu::Item::separator(),
+        mradio(75, t!("По возрастанию", "Ascending", ja: "昇順", pt: "Crescente", zh: "递增"), asc),
+        mradio(76, t!("По убыванию", "Descending", ja: "降順", pt: "Decrescente", zh: "递减"), !asc),
     ];
-    let id = popup_at(h, at, &items);
+    let id = dropdown(h, at, items);
     if id == 0 { return; }
     let id = match id { 75 => 60 + col as u32 * 2, 76 => 61 + col as u32 * 2, x => x };
     PostMessageW(GetParent(h), WM_UI, id as usize, 0);
 }
 
 unsafe fn view_menu(h: HWND, at: RECT) {
-    let m = CreatePopupMenu();
     let view = ST.with_borrow(|s| s.view);
     let g = GROUP.load(Relaxed);
     let compact = COMPACT.load(Relaxed);
@@ -951,66 +973,61 @@ unsafe fn view_menu(h: HWND, at: RECT) {
         let list = ST.with_borrow(|s| s.list);
         SendMessageW(list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) as isize & LVS_EX_CHECKBOXES as isize != 0
     };
-    let add = |m: HMENU, id: usize, label: String, enabled: bool, checked: bool| {
-        let flags = MF_STRING | if enabled { 0 } else { MF_GRAYED } | if checked { MF_CHECKED } else { 0 };
-        AppendMenuW(m, flags, id, w(&label).as_ptr());
-    };
-    add(m, 80, t!("Очень крупные значки", "Extra large icons", ja: "特大アイコン", pt: "Ícones extragrandes", zh: "超大图标").into(), true, view == ViewMode::ExtraLarge);
-    add(m, 81, t!("Крупные значки", "Large icons", ja: "大アイコン", pt: "Ícones grandes", zh: "大图标").into(), true, view == ViewMode::Large);
-    add(m, 82, t!("Обычные значки", "Medium icons", ja: "中アイコン", pt: "Ícones médios", zh: "中等图标").into(), true, view == ViewMode::Medium);
-    add(m, 83, t!("Мелкие значки", "Small icons", ja: "小アイコン", pt: "Ícones pequenos", zh: "小图标").into(), true, view == ViewMode::Small);
-    add(m, 84, t!("Список", "List", ja: "一覧", pt: "Lista", zh: "列表").into(), true, view == ViewMode::List);
-    add(m, 85, t!("Таблица", "Details", ja: "詳細", pt: "Detalhes", zh: "详细信息").into(), true, view == ViewMode::Details);
-    add(m, 86, t!("Плитка", "Tiles", ja: "タイル", pt: "Blocos", zh: "平铺").into(), true, view == ViewMode::Tiles);
-    AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
-    let show = CreatePopupMenu();
-    add(show, 90, t!("Область переходов", "Navigation pane", ja: "ナビゲーション ウィンドウ", pt: "Painel de navegação", zh: "导航窗格").into(), false, true);
-    add(show, 91, t!("Область предпросмотра", "Preview pane", ja: "プレビュー ウィンドウ", pt: "Painel de visualização", zh: "预览窗格").into(), false, false);
-    add(show, 92, t!("Область сведений", "Details pane", ja: "詳細ウィンドウ", pt: "Painel de detalhes", zh: "详细信息窗格").into(), false, false);
-    add(show, 93, t!("Флажки элементов", "Item check boxes", ja: "項目のチェック ボックス", pt: "Caixas de seleção de itens", zh: "项目复选框").into(), true, checks);
-    add(show, 94, t!("Расширения имён файлов", "File name extensions", ja: "ファイル名拡張子", pt: "Extensões de nome de arquivo", zh: "文件扩展名").into(), true, ext);
-    add(show, 95, t!("Скрытые элементы", "Hidden items", ja: "隠しファイル", pt: "Itens ocultos", zh: "隐藏的项目").into(), true, SHOW_HIDDEN.load(Relaxed));
-    add(show, 96, t!("Компактный вид", "Compact view", ja: "コンパクト表示", pt: "Exibição compacta", zh: "紧凑视图").into(), true, compact);
-    AppendMenuW(m, MF_POPUP | MF_STRING, show as usize, w(t!("Показать", "Show", ja: "表示", pt: "Mostrar", zh: "显示")).as_ptr());
-    let group = CreatePopupMenu();
-    add(group, 70, t!("Нет", "(None)", ja: "なし", pt: "(Nenhum)", zh: "(无)").into(), true, g == 0);
-    add(group, 71, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称").into(), true, g == 2);
-    add(group, 72, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期").into(), true, g == 1);
-    add(group, 73, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型").into(), true, g == 3);
-    add(group, 74, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小").into(), true, g == 4);
-    AppendMenuW(m, MF_POPUP | MF_STRING, group as usize, w(t!("Группировать", "Group by", ja: "グループ化", pt: "Agrupar por", zh: "分组依据")).as_ptr());
-    let mut pt = POINT { x: at.left, y: at.bottom + sc(2) };
-    ClientToScreen(h, &mut pt);
-    let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, h, ptr::null());
-    DestroyMenu(m);
+    let mut items = vec![
+        mradio(80, t!("Очень крупные значки", "Extra large icons", ja: "特大アイコン", pt: "Ícones extragrandes", zh: "超大图标"), view == ViewMode::ExtraLarge),
+        mradio(81, t!("Крупные значки", "Large icons", ja: "大アイコン", pt: "Ícones grandes", zh: "大图标"), view == ViewMode::Large),
+        mradio(82, t!("Обычные значки", "Medium icons", ja: "中アイコン", pt: "Ícones médios", zh: "中等图标"), view == ViewMode::Medium),
+        mradio(83, t!("Мелкие значки", "Small icons", ja: "小アイコン", pt: "Ícones pequenos", zh: "小图标"), view == ViewMode::Small),
+        mradio(84, t!("Список", "List", ja: "一覧", pt: "Lista", zh: "列表"), view == ViewMode::List),
+        mradio(85, t!("Таблица", "Details", ja: "詳細", pt: "Detalhes", zh: "详细信息"), view == ViewMode::Details),
+        mradio(86, t!("Плитка", "Tiles", ja: "タイル", pt: "Blocos", zh: "平铺"), view == ViewMode::Tiles),
+        ctxmenu::Item::separator(),
+    ];
+    let show = vec![
+        mcheck(93, t!("Флажки элементов", "Item check boxes", ja: "項目のチェック ボックス", pt: "Caixas de seleção de itens", zh: "项目复选框"), checks),
+        mcheck(94, t!("Расширения имён файлов", "File name extensions", ja: "ファイル名拡張子", pt: "Extensões de nome de arquivo", zh: "文件扩展名"), ext),
+        mcheck(95, t!("Скрытые элементы", "Hidden items", ja: "隠しファイル", pt: "Itens ocultos", zh: "隐藏的项目"), SHOW_HIDDEN.load(Relaxed)),
+        mcheck(96, t!("Компактный вид", "Compact view", ja: "コンパクト表示", pt: "Exibição compacta", zh: "紧凑视图"), compact),
+    ];
+    let show_entry = ctxmenu::Item { text: t!("Показать", "Show", ja: "表示", pt: "Mostrar", zh: "显示").into(), glyph: "\u{E7B3}", sub: show, ..Default::default() };
+    items.push(show_entry);
+    let group = vec![
+        mradio(70, t!("Нет", "(None)", ja: "なし", pt: "(Nenhum)", zh: "(无)"), g == 0),
+        mradio(71, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称"), g == 2),
+        mradio(72, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期"), g == 1),
+        mradio(73, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型"), g == 3),
+        mradio(74, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"), g == 4),
+    ];
+    items.push(ctxmenu::Item { text: t!("Группировать", "Group by", ja: "グループ化", pt: "Agrupar por", zh: "分组依据").into(), glyph: "\u{E8FD}", sub: group, ..Default::default() });
+    let id = dropdown(h, at, items);
     if id != 0 { PostMessageW(GetParent(h), WM_UI, id as usize, 0); }
 }
 
 unsafe fn more_menu(h: HWND, at: RECT) {
     let sel = selected_count();
-    let items = [
-        (44u32, t!("Выделить все", "Select all", ja: "すべて選択", pt: "Selecionar tudo", zh: "全选").to_string(), true, false),
-        (45, t!("Инвертировать выделение", "Invert selection", ja: "選択を反転", pt: "Inverter seleção", zh: "反向选择").to_string(), true, false),
-        (46, t!("Копировать путь", "Copy path", ja: "パスのコピー", pt: "Copiar caminho", zh: "复制路径").to_string(), true, false),
-        (47, t!("Открыть в новом окне", "Open in new window", ja: "新しいウィンドウで開く", pt: "Abrir em nova janela", zh: "在新窗口中打开").to_string(), true, false),
-        (48, t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性").to_string(), sel > 0, false),
-        (49, t!("Параметры", "Options", ja: "オプション", pt: "Opções", zh: "选项").to_string(), false, false),
+    let items = vec![
+        mi(44, t!("Выделить все", "Select all", ja: "すべて選択", pt: "Selecionar tudo", zh: "全选")),
+        mi(45, t!("Инвертировать выделение", "Invert selection", ja: "選択を反転", pt: "Inverter seleção", zh: "反向选择")),
+        mi(46, t!("Копировать путь", "Copy path", ja: "パスのコピー", pt: "Copiar caminho", zh: "复制路径")),
+        mi(47, t!("Открыть в новом окне", "Open in new window", ja: "新しいウィンドウで開く", pt: "Abrir em nova janela", zh: "在新窗口中打开")),
+        if sel > 0 { mi(48, t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性")) } else { moff(48, t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性")) },
+        moff(49, t!("Параметры", "Options", ja: "オプション", pt: "Opções", zh: "选项")),
     ];
-    let id = popup_at(h, at, &items);
+    let id = dropdown(h, at, items);
     if id != 0 { PostMessageW(GetParent(h), WM_UI, id as usize, 0); }
 }
 
 unsafe fn tab_menu(h: HWND, i: usize, at: RECT) {
-    let m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, 1, w(t!("Дублировать вкладку", "Duplicate tab", ja: "タブを複製", pt: "Duplicar guia", zh: "复制标签页")).as_ptr());
-    AppendMenuW(m, MF_STRING, 2, w(t!("Закрыть вкладку", "Close tab", ja: "タブを閉じる", pt: "Fechar guia", zh: "关闭标签页")).as_ptr());
-    AppendMenuW(m, MF_STRING, 3, w(t!("Закрыть остальные", "Close other tabs", ja: "他のタブを閉じる", pt: "Fechar outras guias", zh: "关闭其他标签页")).as_ptr());
-    AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
-    AppendMenuW(m, MF_STRING, 4, w(t!("Копировать путь", "Copy path", ja: "パスのコピー", pt: "Copiar caminho", zh: "复制路径")).as_ptr());
+    let items = vec![
+        mi(1, t!("Дублировать вкладку", "Duplicate tab", ja: "タブを複製", pt: "Duplicar guia", zh: "复制标签页")),
+        mi(2, t!("Закрыть вкладку", "Close tab", ja: "タブを閉じる", pt: "Fechar guia", zh: "关闭标签页")),
+        mi(3, t!("Закрыть остальные", "Close other tabs", ja: "他のタブを閉じる", pt: "Fechar outras guias", zh: "关闭其他标签页")),
+        ctxmenu::Item::separator(),
+        mi(4, t!("Копировать путь", "Copy path", ja: "パスのコピー", pt: "Copiar caminho", zh: "复制路径")),
+    ];
     let mut pt = POINT { x: at.left, y: at.bottom };
     ClientToScreen(h, &mut pt);
-    let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
-    DestroyMenu(m);
+    let id = match ctxmenu::show(GetParent(h), items, (pt.x, pt.y)) { ctxmenu::Pick::Id(id) => id, ctxmenu::Pick::None => 0 };
     let main = GetParent(h);
     match id {
         1 => { PostMessageW(main, WM_UI, 29, i as isize); }
@@ -1040,11 +1057,34 @@ fn reorder_tab(from: usize, to: usize) {
 unsafe fn history_menu(h: HWND, at: RECT, back: bool) {
     let (v, pos) = ST.with_borrow(|st| (st.hist.v.clone(), st.hist.pos));
     let mut items = vec![];
-    if back { for i in (0..pos).rev() { items.push((i as u32 + 1, v[i].to_string_lossy().into_owned(), true, false)); } }
-    else { for i in pos + 1..v.len() { items.push((i as u32 + 1, v[i].to_string_lossy().into_owned(), true, false)); } }
+    if back { for i in (0..pos).rev() { items.push(mi(i as u32 + 1, &v[i].to_string_lossy())); } }
+    else { for i in pos + 1..v.len() { items.push(mi(i as u32 + 1, &v[i].to_string_lossy())); } }
     if items.is_empty() { return; }
-    let id = popup_at(h, at, &items);
+    let id = dropdown(h, at, items);
     if id > 0 { PostMessageW(GetParent(h), WM_UI, 23, (id - 1) as isize); }
+}
+
+/// The empty part of the tab row: it acts as the window's title bar.
+fn ground(y: i32) -> bool { y < sc(TITLE_H) }
+
+/// Dragging that empty spot moves, maximizes (to the top edge) and snaps the window as a caption does.
+unsafe fn drag_window(h: HWND, x: i32, y: i32) {
+    let mut pt = POINT { x, y };
+    ClientToScreen(h, &mut pt);
+    ReleaseCapture();
+    SendMessageW(GetParent(h), WM_NCLBUTTONDOWN, HTCAPTION as usize, (pt.x as isize & 0xFFFF) | ((pt.y as isize & 0xFFFF) << 16));
+}
+
+/// Right click on that spot: the window's own menu (Move, Size, Close...), as on a real title bar.
+unsafe fn system_menu(h: HWND, x: i32, y: i32) {
+    let p = GetParent(h);
+    let m = GetSystemMenu(p, 0);
+    if m.is_null() { return; }
+    let mut pt = POINT { x, y };
+    ClientToScreen(h, &mut pt);
+    SetForegroundWindow(p);
+    let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, p, ptr::null());
+    if id != 0 { PostMessageW(p, WM_SYSCOMMAND, id as usize, 0); }
 }
 
 pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -1080,7 +1120,19 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         WM_LBUTTONDOWN | WM_MBUTTONDOWN => {
             let l = layout_now();
             let k = hit(&l, x, y);
+            match k {
+                WMIN => { PostMessageW(GetParent(h), WM_SYSCOMMAND, SC_MINIMIZE as usize, 0); return 0; }
+                WMAX => {
+                    let p = GetParent(h);
+                    let c = if IsZoomed(p) != 0 { SC_RESTORE } else { SC_MAXIMIZE };
+                    PostMessageW(p, WM_SYSCOMMAND, c as usize, 0);
+                    return 0;
+                }
+                WCLOSE => { PostMessageW(GetParent(h), WM_CLOSE, 0, 0); return 0; }
+                _ => {}
+            }
             if k == NONE {
+                if ground(y) { drag_window(h, x, y); return 0; }
                 if let Some(i) = crumb_at(x, y) {
                     PRESS.set((CRUMB + i as i32, now()));
                     PostMessageW(GetParent(h), WM_UI, 21, i as isize); // a path part: go there
@@ -1156,6 +1208,7 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_RBUTTONUP => {
             let l = layout_now();
+            if ground(y) && hit(&l, x, y) == NONE { system_menu(h, x, y); return 0; }
             if inside(&l.back, x, y) { history_menu(h, l.back, true); return 0; }
             if inside(&l.fwd, x, y) { history_menu(h, l.fwd, false); return 0; }
             if let Some(i) = l.tabs.iter().position(|t| inside(t, x, y)) {
@@ -1163,6 +1216,18 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 crate::tab_select(main, i);
                 tab_menu(h, i, l.tabs[i]);
             }
+        }
+        WM_LBUTTONDBLCLK => {
+            if ground(y) && hit(&layout_now(), x, y) == NONE {
+                let p = GetParent(h);
+                let c = if IsZoomed(p) != 0 { SC_RESTORE } else { SC_MAXIMIZE };
+                PostMessageW(p, WM_SYSCOMMAND, c as usize, 0);
+            }
+        }
+        WM_NCHITTEST => {
+            // the top strip is the window's edge (its caption is ours): let the parent report a resize border there
+            if y < sc(5) && IsZoomed(GetParent(h)) == 0 { return HTTRANSPARENT as LRESULT; }
+            return DefWindowProcW(h, m, wp, lp);
         }
         WM_COMMAND if matches!((wp >> 16) as u32, 0x0100 | 0x0200) => {
             // the address box is shown only while typing (the path parts otherwise); the search box stays visible
