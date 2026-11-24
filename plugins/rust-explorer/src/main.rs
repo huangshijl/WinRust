@@ -17,9 +17,9 @@
 //   shortcuts: wallpaper is loaded once (changing it needs a restart), icon labels are always white, no background menu /
 //   drag-to-position / auto-arrange, items from the public desktop can't be renamed.
 #![windows_subsystem = "windows"]
-use std::{cell::RefCell, env, fs, os::windows::fs::MetadataExt, path::{Path, PathBuf}, ptr, sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed}};
+use std::{cell::RefCell, env, fs, os::windows::fs::MetadataExt, path::{Path, PathBuf}, ptr, sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed}};
 use winrust_common::{t, tf};
-use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{GetStockObject, InvalidateRect}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT}, Shell::*, WindowsAndMessaging::*}};
+use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{GetStockObject, InvalidateRect}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetCapture, GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT}, Shell::*, WindowsAndMessaging::*}};
 
 mod zipx; // our own ZIP engine (deflate, inflate, container)
 mod jobs; // our own copier, ZIP packer, ZIP/7z unpacker (background, progress in the status line)
@@ -73,6 +73,70 @@ fn saved_place() -> Option<(bool, RECT)> {
     let (max, r) = parse_place(&fs::read_to_string(place_file()).ok()?)?;
     (!unsafe { MonitorFromRect(&r, MONITOR_DEFAULTTONULL) }.is_null()).then_some((max, r))
 }
+
+// ---------- per-folder view memory (view, sort, grouping, column widths) and global show switches ----------
+
+fn views_file() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\views.txt") }
+fn read_views() -> Vec<String> { fs::read_to_string(views_file()).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(str::to_string).collect() }
+fn write_views(lines: &[String]) {
+    let f = views_file();
+    let _ = fs::create_dir_all(f.parent().unwrap_or(&f));
+    let _ = fs::write(f, lines.join("\n"));
+}
+fn pref_key(dir: &PathBuf) -> String { dir.to_string_lossy().to_lowercase() }
+
+/// (view, sort column, ascending, group mode, the four column widths) saved for `dir`.
+fn read_view_pref(dir: &PathBuf) -> Option<(ViewMode, usize, bool, usize, [i32; 4])> {
+    let key = pref_key(dir);
+    for l in read_views() {
+        let mut it = l.split('\t');
+        if it.next()? != key { continue; }
+        let view = ViewMode::from_code(it.next()?.parse().ok()?)?;
+        let sort = it.next()?.parse().ok()?;
+        let asc = it.next()? == "1";
+        let group = it.next()?.parse().ok()?;
+        let w: Vec<i32> = it.filter_map(|x| x.parse().ok()).collect();
+        if w.len() == 4 { return Some((view, sort, asc, group, [w[0], w[1], w[2], w[3]])); }
+    }
+    None
+}
+
+/// Saves how the current folder is shown (called after a view, sort or grouping change and column drags).
+pub(crate) fn save_current_view() {
+    if desk() || in_zip() { return; }
+    let (dir, view) = ST.with_borrow(|st| (st.dir.clone(), st.view));
+    let list = ST.with_borrow(|st| st.list);
+    let defaults = [ui::sc(560), ui::sc(160), ui::sc(140), ui::sc(96)];
+    // icon views report no column widths: keep the ones saved for this folder (or the defaults)
+    let widths = if view == ViewMode::Details {
+        let w: Vec<i32> = (0..4).map(|k| put(list, LVM_GETCOLUMNWIDTH, k as usize, 0) as i32).collect();
+        if w.iter().all(|&x| x > 0) { [w[0], w[1], w[2], w[3]] } else { defaults }
+    } else {
+        read_view_pref(&dir).map(|p| p.4).filter(|w| w.iter().all(|&x| x > 0)).unwrap_or(defaults)
+    };
+    let key = pref_key(&dir);
+    let line = format!("{key}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", view.code(), SORT_COL.load(Relaxed), u8::from(SORT_ASC.load(Relaxed)), GROUP.load(Relaxed), widths[0], widths[1], widths[2], widths[3]);
+    let mut lines: Vec<String> = read_views().into_iter().filter(|l| !l.starts_with("*\t") && l.split('\t').next() != Some(key.as_str())).collect();
+    lines.push(line);
+    write_views(&lines);
+}
+
+fn read_globals() -> Option<(bool, bool)> {
+    for l in read_views() {
+        let mut it = l.split('\t');
+        if it.next()? != "*" { continue; }
+        let compact = it.next()? == "1";
+        let ext = it.next()? == "1";
+        return Some((compact, ext));
+    }
+    None
+}
+
+fn save_globals() {
+    let mut lines: Vec<String> = read_views().into_iter().filter(|l| !l.starts_with("*\t")).collect();
+    lines.push(format!("*\t{}\t{}", u8::from(COMPACT.load(Relaxed)), u8::from(SHOW_EXT.load(Relaxed))));
+    write_views(&lines);
+}
 /// What the bar reserves at the top and bottom of the screen: the work area topbar sets when there is no explorer.
 fn work_strips() -> (i32, i32) {
     let mut r: RECT = unsafe { std::mem::zeroed() };
@@ -91,14 +155,28 @@ fn desk_bottom() -> i32 {
 const THUMB: i32 = 96;
 const WM_THUMB: u32 = WM_APP + 2; // worker -> UI: wp = Box<(era, row, HBITMAP)>
 static GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // bumped on every new listing; stale thumbnails are dropped
-static TX: std::sync::OnceLock<std::sync::mpsc::Sender<(u32, usize, PathBuf)>> = std::sync::OnceLock::new();
+static TX: std::sync::OnceLock<std::sync::mpsc::Sender<(u32, usize, PathBuf, i32)>> = std::sync::OnceLock::new();
 const WM_GO: u32 = WM_APP + 1; // address bar: Enter (wp 13) / Esc (wp 27)
 const WM_SEARCH: u32 = WM_APP + 7; // search box: Enter (wp 13) / Esc (wp 27)
 static EDIT_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static SEARCH_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static LABEL_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0); // the rename box (only one exists at a time)
 
+#[derive(Clone)]
 struct Row { name: String, dir: bool, size: u64, time: u64, icon: i32, thumb: i32, hdr: bool } // time: FILETIME ticks; thumb: -2 not asked, -1 asked, >=0 image-list index
+
+/// Explorer's view modes. Details and the icon sizes; Tiles shows 48 px pictures with type and size.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode { Details, List, Small, Medium, Large, ExtraLarge, Tiles }
+impl ViewMode {
+    fn from_action(n: usize) -> Option<Self> {
+        Some(match n { 80 => Self::ExtraLarge, 81 => Self::Large, 82 => Self::Medium, 83 => Self::Small, 84 => Self::List, 85 => Self::Details, 86 => Self::Tiles, _ => return None })
+    }
+    fn code(self) -> u8 { match self { Self::Details => 0, Self::List => 1, Self::Small => 2, Self::Medium => 3, Self::Large => 4, Self::ExtraLarge => 5, Self::Tiles => 6 } }
+    fn from_code(n: u8) -> Option<Self> { Some(match n { 0 => Self::Details, 1 => Self::List, 2 => Self::Small, 3 => Self::Medium, 4 => Self::Large, 5 => Self::ExtraLarge, 6 => Self::Tiles, _ => return None }) }
+    fn icon_px(self) -> i32 { match self { Self::Medium | Self::Tiles => 48, Self::Large => 96, Self::ExtraLarge => 256, _ => 16 } }
+    fn wants_thumbs(self) -> bool { matches!(self, Self::Medium | Self::Large | Self::ExtraLarge | Self::Tiles) }
+}
 
 /// Back / forward trail of visited folders (one for the whole window, not per tab).
 #[derive(Default)]
@@ -114,33 +192,42 @@ impl Hist {
     fn forward(&mut self) -> Option<PathBuf> { if self.pos + 1 < self.v.len() { self.pos += 1; Some(self.v[self.pos].clone()) } else { None } }
 }
 
-struct State { list: HWND, tab: HWND, edit: HWND, search: HWND, dir: PathBuf, rows: Vec<Row>, thumbs: bool, himl: isize, tabs: Vec<PathBuf>, active: usize, hist: Hist, closed: Vec<PathBuf> }
+struct State { list: HWND, tab: HWND, edit: HWND, search: HWND, dir: PathBuf, rows: Vec<Row>, all: Vec<Row>, thumbs: bool, view: ViewMode, himl: isize, iml_px: i32, tabs: Vec<PathBuf>, active: usize, hist: Hist, closed: Vec<PathBuf> }
 thread_local! {
-    static ST: RefCell<State> = RefCell::new(State { list: 0 as _, tab: 0 as _, edit: 0 as _, search: 0 as _, dir: PathBuf::new(), rows: vec![], thumbs: false, himl: 0, tabs: vec![], active: 0, hist: Hist { v: vec![], pos: 0 }, closed: vec![] });
+    static ST: RefCell<State> = RefCell::new(State { list: 0 as _, tab: 0 as _, edit: 0 as _, search: 0 as _, dir: PathBuf::new(), rows: vec![], all: vec![], thumbs: false, view: ViewMode::Details, himl: 0, iml_px: 96, tabs: vec![], active: 0, hist: Hist { v: vec![], pos: 0 }, closed: vec![] });
+    static COLLAPSED: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new()); // group headings the user collapsed
 }
 static SORT_COL: AtomicUsize = AtomicUsize::new(0); // 0 name, 1 size, 2 modified
 static SORT_ASC: AtomicBool = AtomicBool::new(true);
 static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false); // Ctrl+H
+static SHOW_EXT: AtomicBool = AtomicBool::new(true); // View > File name extensions
+static COMPACT: AtomicBool = AtomicBool::new(false); // View > Compact view
 static NAV: AtomicBool = AtomicBool::new(false); // loading from the back / forward trail: do not record it again
 const WM_NAV: u32 = WM_APP + 3; // wp: 1 back, 2 forward, 3 properties, 4 up (sent from the message loop for Alt+key)
 const WM_JOB: u32 = WM_APP + 5; // jobs.rs worker finished: wp = Box<Option<String>> (the error, if any)
+const WM_REFRESH: u32 = WM_APP + 8; // the folder changed on disk (watch thread)
+static WATCH_GEN: AtomicU32 = AtomicU32::new(0); // bumped on every load: older watch threads exit
 
 fn row(name: String, m: Option<&fs::Metadata>) -> Row {
     Row { name, dir: m.is_some_and(|m| m.is_dir()), size: m.map_or(0, |m| m.len()), time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2, hdr: false }
 }
 
-/// Folders always first; inside each group by the column (0 name, 1 size, 2 modified), ties by name.
+/// Folders first when ungrouped; grouped by date / name / type / size, then by the chosen column.
 fn sort_rows(rows: &mut [Row], col: usize, asc: bool) {
     let key = |r: &Row| r.name.rsplit('\\').next().unwrap_or("").to_lowercase();
-    rows.sort_by(|a, b| {
+    let order = |a: &Row, b: &Row| {
         let o = match col { 1 => a.time.cmp(&b.time), 2 => type_text(&a.name, a.dir).cmp(&type_text(&b.name, b.dir)), 3 => a.size.cmp(&b.size), _ => key(a).cmp(&key(b)) };
-        (!a.dir).cmp(&!b.dir).then(if asc { o } else { o.reverse() }).then_with(|| key(a).cmp(&key(b)))
-    });
-    // grouped by date: the groups are contiguous (the stable sort keeps the order above inside each one)
-    if group_on() { bucket_refresh(); rows.sort_by_cached_key(|r| bucket(r.time)); }
+        if asc { o } else { o.reverse() }
+    };
+    if group_on() {
+        if GROUP.load(Relaxed) == 1 { bucket_refresh(); }
+        rows.sort_by(|a, b| group_key(a).0.cmp(&group_key(b).0).then_with(|| order(a, b)).then_with(|| key(a).cmp(&key(b))));
+    } else {
+        rows.sort_by(|a, b| (!a.dir).cmp(&!b.dir).then_with(|| order(a, b)).then_with(|| key(a).cmp(&key(b))));
+    }
 }
 
-// ---------- grouping by date ("Group by date" in the folder's menu): Today, Yesterday, Earlier this week, ... ----------
+// ---------- grouping ("Group by" in the view menu): date, name, type, size ----------
 
 const DAY: i64 = 864_000_000_000; // FILETIME ticks per day
 /// The date headings of "Group by date", in bucket order: shown above the rows of each group.
@@ -161,9 +248,10 @@ thread_local! {
     static BCTX: std::cell::Cell<(i64, i64)> = const { std::cell::Cell::new((0, 0)) }; // (today's local day number, local - UTC in ticks)
 }
 
-fn group_marker() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\group-by-date") }
-static THUMBS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false); // thumbnail view: no headings
-fn group_on() -> bool { !desk() && !THUMBS.load(Relaxed) && group_marker().exists() }
+/// 0 none, 1 date, 2 name, 3 type, 4 size.
+static GROUP: AtomicUsize = AtomicUsize::new(0);
+static THUMBS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false); // not the details view: no headings
+fn group_on() -> bool { !desk() && !THUMBS.load(Relaxed) && GROUP.load(Relaxed) != 0 }
 
 /// Takes "now" and the time zone offset once, so bucket() is plain arithmetic while a folder is sorted and painted.
 fn bucket_refresh() {
@@ -189,21 +277,88 @@ fn bucket(time: u64) -> i32 {
     }
 }
 
-/// A heading row ("Today", ...) before the first row of each date group. Its name starts with '?', which no file can have.
+/// The Windows 11 size groups: folders first, then Empty, Tiny, Small, Medium, Large, Huge, Gigantic.
+fn size_group(r: &Row) -> (u8, String) {
+    if r.dir { return (0, t!("Папка с файлами", "File folder", ja: "ファイル フォルダー", pt: "Pasta de arquivos", zh: "文件夹").into()); }
+    let b = r.size;
+    let (n, label) = if b == 0 {
+        (1, t!("Пустой файл", "Empty", ja: "空", pt: "Vazio", zh: "空") )
+    } else if b < 16 << 10 {
+        (2, t!("Крошечный", "Tiny", ja: "極小", pt: "Mínimo", zh: "极小"))
+    } else if b < 1 << 20 {
+        (3, t!("Маленький", "Small", ja: "小", pt: "Pequeno", zh: "小"))
+    } else if b < 16 << 20 {
+        (4, t!("Средний", "Medium", ja: "中", pt: "Médio", zh: "中"))
+    } else if b < 128 << 20 {
+        (5, t!("Большой", "Large", ja: "大", pt: "Grande", zh: "大"))
+    } else if b < 1 << 30 {
+        (6, t!("Огромный", "Huge", ja: "特大", pt: "Enorme", zh: "巨大"))
+    } else {
+        (7, t!("Гигантский", "Gigantic", ja: "巨大", pt: "Gigantesco", zh: "超大"))
+    };
+    (n, label.into())
+}
+
+/// (sort key, heading) of the row in the current grouping.
+fn group_key(r: &Row) -> (String, String) {
+    match GROUP.load(Relaxed) {
+        1 => { let b = bucket(r.time) as usize; (format!("{b:02}"), bucket_name(b).to_string()) }
+        2 => {
+            let c = r.name.rsplit('\\').next().unwrap_or(&r.name).chars().next().unwrap_or('#').to_uppercase().next().unwrap_or('#');
+            let label = if c.is_alphanumeric() { c.to_string() } else { "#".into() };
+            (label.to_lowercase(), label)
+        }
+        3 => { let label = type_text(&r.name, r.dir); (label.to_lowercase(), label) }
+        _ => { let (n, label) = size_group(r); (format!("{n:02}"), label) }
+    }
+}
+
+/// A heading row before the first row of each group. Its name starts with '?', which no file can have.
 fn add_headers(rows: &mut Vec<Row>) {
     if !group_on() { return; }
-    bucket_refresh();
+    if GROUP.load(Relaxed) == 1 { bucket_refresh(); }
     let mut out = Vec::with_capacity(rows.len() + 8);
-    let mut last = -1;
+    let mut last = String::new();
     for r in rows.drain(..) {
-        let b = bucket(r.time);
-        if b != last {
-            last = b;
-            out.push(Row { name: format!("?{}", bucket_name(b as usize)), dir: false, size: 0, time: 0, icon: -1, thumb: -1, hdr: true });
+        let (_, label) = group_key(&r);
+        if label != last {
+            last = label.clone();
+            out.push(Row { name: format!("?{label}"), dir: false, size: 0, time: 0, icon: -1, thumb: -1, hdr: true });
         }
         out.push(r);
     }
     *rows = out;
+}
+
+/// Notes the group headings the user collapsed and removes their rows from the display list.
+pub(crate) fn group_collapsed(label: &str) -> bool { COLLAPSED.with_borrow(|s| s.contains(label)) }
+
+fn visible_rows(all: &[Row]) -> Vec<Row> {
+    let mut out = Vec::with_capacity(all.len());
+    let mut closed = false;
+    for r in all {
+        if r.hdr { closed = group_collapsed(&r.name[1..]); out.push(r.clone()); }
+        else if !closed { out.push(r.clone()); }
+    }
+    out
+}
+
+fn toggle_group(h: HWND, label: &str) {
+    COLLAPSED.with_borrow_mut(|s| { if !s.remove(label) { s.insert(label.to_string()); } });
+    refilter(h);
+}
+
+fn refilter(h: HWND) {
+    let (list, n) = ST.with_borrow_mut(|st| {
+        st.all.iter_mut().for_each(|r| r.thumb = -2);
+        st.rows = visible_rows(&st.all);
+        (st.list, st.rows.len())
+    });
+    reset_thumbs();
+    put(list, LVM_DELETEALLITEMS, 0, 0);
+    put(list, LVM_SETITEMCOUNT, n, 0);
+    if n > 0 { put(list, LVM_REDRAWITEMS, 0, n as isize - 1); }
+    unsafe { ui::status_dirty(h) };
 }
 
 /// Explorer's "Type" column in short form: "File folder", "TXT file", "File".
@@ -220,13 +375,17 @@ fn size_text(b: u64) -> String {
 }
 
 fn date_text(ft: u64) -> String {
-    use windows_sys::Win32::{Foundation::{FILETIME, SYSTEMTIME}, System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime}};
+    use windows_sys::Win32::{Foundation::{FILETIME, SYSTEMTIME}, Globalization::{GetDateFormatW, GetTimeFormatW, DATE_SHORTDATE, LOCALE_USER_DEFAULT, TIME_NOSECONDS}, System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime}};
     if ft == 0 { return String::new(); }
     unsafe {
         let f = FILETIME { dwLowDateTime: ft as u32, dwHighDateTime: (ft >> 32) as u32 };
         let (mut u, mut l): (SYSTEMTIME, SYSTEMTIME) = (std::mem::zeroed(), std::mem::zeroed());
         if FileTimeToSystemTime(&f, &mut u) == 0 || SystemTimeToTzSpecificLocalTime(ptr::null(), &u, &mut l) == 0 { return String::new(); }
-        format!("{:04}-{:02}-{:02} {:02}:{:02}", l.wYear, l.wMonth, l.wDay, l.wHour, l.wMinute)
+        let (mut d, mut t) = ([0u16; 64], [0u16; 64]);
+        let dn = GetDateFormatW(LOCALE_USER_DEFAULT, DATE_SHORTDATE, &l, ptr::null(), d.as_mut_ptr(), d.len() as i32);
+        let tn = GetTimeFormatW(LOCALE_USER_DEFAULT, TIME_NOSECONDS, &l, ptr::null(), t.as_mut_ptr(), t.len() as i32);
+        if dn <= 0 || tn <= 0 { return String::new(); }
+        format!("{} {}", String::from_utf16_lossy(&d[..(dn - 1) as usize]), String::from_utf16_lossy(&t[..(tn - 1) as usize]))
     }
 }
 
@@ -484,7 +643,7 @@ unsafe fn bg_menu(h: HWND) {
         for (id, lbl) in sort { AppendMenuW(m, MF_STRING, id, w(lbl).as_ptr()); }
     }
     if !desk() {
-        let lbl = if group_on() { t!("Без группировки", "No grouping", ja: "グループ化しない", pt: "Sem agrupamento", zh: "不分组") } else { t!("Группировать по дате", "Group by date", ja: "日付でグループ化", pt: "Agrupar por data", zh: "按日期分组") };
+        let lbl = if GROUP.load(Relaxed) == 1 { t!("Без группировки", "No grouping", ja: "グループ化しない", pt: "Sem agrupamento", zh: "不分组") } else { t!("Группировать по дате", "Group by date", ja: "日付でグループ化", pt: "Agrupar por data", zh: "按日期分组") };
         AppendMenuW(m, MF_STRING, 13, w(lbl).as_ptr());
     }
     if desk() {
@@ -502,10 +661,7 @@ unsafe fn bg_menu(h: HWND) {
     let dir = cur_dir();
     match id {
         7 => set_icons_hidden(!icons_hidden()),
-        13 => {
-            let k = group_marker();
-            if group_on() { let _ = fs::remove_file(&k); } else { if let Some(d) = k.parent() { let _ = fs::create_dir_all(d); } let _ = fs::write(&k, "1"); }
-        }
+        13 => group_now(h, if GROUP.load(Relaxed) == 1 { 0 } else { 1 }),
         12 => { // the grid changes with the size: icons are laid out again
             let k = small_marker();
             if k.exists() { let _ = fs::remove_file(&k); } else { let _ = fs::write(&k, "1"); }
@@ -613,12 +769,27 @@ fn tab_text(tab: HWND, _i: usize, _text: &str, _insert: bool) {
 }
 
 /// The text of a desktop row. Rows from the public desktop carry absolute paths: only the file name is shown, and shortcuts
-/// lose their ".lnk" / ".url" like in Explorer. Other windows show the row as it is.
-fn shown_name(name: &str, desktop: bool) -> String {
-    if !desktop { return name.to_string(); }
-    let file = std::path::Path::new(name).file_name().map_or_else(|| name.to_string(), |n| n.to_string_lossy().into_owned());
-    let lower = file.to_lowercase();
-    if lower.ends_with(".lnk") || lower.ends_with(".url") { file[..file.len() - 4].to_string() } else { file }
+/// lose their ".lnk" / ".url" like in Explorer. Other windows show the row as it is, with extensions hidden if the view says so.
+pub(crate) fn shown_name(name: &str, desktop: bool, dir: bool) -> String {
+    if desktop {
+        let file = std::path::Path::new(name).file_name().map_or_else(|| name.to_string(), |n| n.to_string_lossy().into_owned());
+        let lower = file.to_lowercase();
+        return if lower.ends_with(".lnk") || lower.ends_with(".url") { file[..file.len() - 4].to_string() } else { file };
+    }
+    if dir || SHOW_EXT.load(Relaxed) { return name.to_string(); }
+    let file = name.rsplit('\\').next().unwrap_or(name);
+    match file.rsplit_once('.') {
+        Some((stem, e)) if !stem.is_empty() && !e.is_empty() => stem.to_string(),
+        _ => file.to_string(),
+    }
+}
+
+fn hide_extensions() -> bool {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let (mut v, mut cb) = (0u32, 4u32);
+    let sub = w(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
+    let rc = unsafe { RegGetValueW(HKEY_CURRENT_USER, sub.as_ptr(), w("HideFileExt").as_ptr(), RRF_RT_REG_DWORD, ptr::null_mut(), &mut v as *mut _ as *mut _, &mut cb) };
+    rc == 0 && v != 0
 }
 
 fn label(dir: &PathBuf) -> String {
@@ -663,11 +834,26 @@ fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
 /// Loads `dir` into the virtual list and the active tab. Unreadable dir (access denied, gone) leaves the view unchanged.
 /// Never call with ST borrowed: the list sends GETDISPINFO back into the window proc.
 fn load(h: HWND, dir: PathBuf) {
+    if !ST.with_borrow(|st| st.dir == dir) { COLLAPSED.with_borrow_mut(|s| s.clear()); } // another folder: its groups start open
+    if !desk() {
+        let list = ST.with_borrow(|st| st.list);
+        if let Some((view, sort, asc, group, w)) = read_view_pref(&dir) {
+            SORT_COL.store(sort, Relaxed);
+            SORT_ASC.store(asc, Relaxed);
+            GROUP.store(group, Relaxed);
+            ST.with_borrow_mut(|st| { st.view = view; st.thumbs = view != ViewMode::Details; });
+            THUMBS.store(view != ViewMode::Details, Relaxed);
+            apply_view(list, view);
+            if w.iter().all(|&x| x > 0) { for (k, wd) in w.iter().enumerate() { put(list, LVM_SETCOLUMNWIDTH, k, *wd as isize); } }
+        }
+    }
     let Some(rows) = rows_of(&dir) else { return };
     if !desk() { unsafe { SetWindowTextW(h, w(&window_title(&dir)).as_ptr()) }; }
     let (list, tab, edit, search, active, n) = ST.with_borrow_mut(|st| {
         if let Some(t) = st.tabs.get_mut(st.active) { *t = dir.clone(); }
-        st.dir = dir.clone(); st.rows = rows;
+        st.dir = dir.clone();
+        st.all = rows;
+        st.rows = visible_rows(&st.all);
         if !NAV.load(Relaxed) { st.hist.visit(dir.clone()); }
         (st.list, st.tab, st.edit, st.search, st.active, st.rows.len())
     });
@@ -681,6 +867,7 @@ fn load(h: HWND, dir: PathBuf) {
     put(list, LVM_DELETEALLITEMS, 0, 0);
     if desk() { desk::fill(list, n); } else { put(list, LVM_SETITEMCOUNT, n, 0); }
     unsafe { ui::status_dirty(h) }; // the counts belong to the folder that was just opened
+    start_watch(h, dir);
 }
 
 /// Asks the rust-search service of drive `d` (see plugins/rust-search): terms in, one path per line out.
@@ -717,7 +904,7 @@ fn search(h: HWND, q: &str) {
     let n = rows.len();
     ui::set_search(Some(q.to_string()));
     if let Some(se) = ST.with_borrow(|st| (st.search != 0 as HWND).then_some(st.search)) { unsafe { SetWindowTextW(se, w(q).as_ptr()) }; }
-    let list = ST.with_borrow_mut(|st| { st.rows = rows; st.list });
+    let list = ST.with_borrow_mut(|st| { st.all = rows; st.rows = visible_rows(&st.all); st.list });
     reset_thumbs();
     put(list, LVM_DELETEALLITEMS, 0, 0);
     put(list, LVM_SETITEMCOUNT, n, 0);
@@ -764,6 +951,63 @@ fn reset_thumbs() {
 }
 
 fn reload(h: HWND) { load(h, cur_dir()); }
+
+/// Watches `dir` and posts WM_REFRESH when its listing changes; the previous watcher stops on the generation bump.
+fn start_watch(h: HWND, dir: PathBuf) {
+    let era = WATCH_GEN.fetch_add(1, Relaxed) + 1;
+    if desk() || zipx::split_zip(&dir).is_some() { return; }
+    let path = dir.to_string_lossy().replace('/', "\\");
+    let main = h as isize;
+    std::thread::spawn(move || unsafe {
+        use windows_sys::Win32::{Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT, INVALID_HANDLE_VALUE}, Storage::FileSystem::{FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE}, System::Threading::WaitForSingleObject};
+        let p = w(&path);
+        let ch = FindFirstChangeNotificationW(p.as_ptr(), 0, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
+        if ch == INVALID_HANDLE_VALUE { return; }
+        loop {
+            if WATCH_GEN.load(Relaxed) != era { break; }
+            match WaitForSingleObject(ch, 500) {
+                WAIT_OBJECT_0 => {
+                    if WATCH_GEN.load(Relaxed) != era { break; }
+                    let _ = PostMessageW(main as HWND, WM_REFRESH, 0, 0);
+                    if FindNextChangeNotification(ch) == 0 { break; }
+                }
+                WAIT_TIMEOUT => {}
+                _ => break,
+            }
+        }
+        let _ = FindCloseChangeNotification(ch);
+    });
+}
+
+/// Reloads the current folder after a change on disk, keeping the selection and the scroll position.
+fn reload_keep(h: HWND) {
+    if ui::searching() || in_zip() { return; }
+    let (names, top) = ST.with_borrow(|st| {
+        let (mut names, mut i) = (vec![], -1isize);
+        loop {
+            i = put(st.list, LVM_GETNEXTITEM, i as usize, LVNI_SELECTED as isize);
+            let Some(r) = usize::try_from(i).ok().and_then(|i| st.rows.get(i)) else { break };
+            if !r.hdr { names.push(r.name.clone()); }
+        }
+        (names, put(st.list, LVM_GETTOPINDEX, 0, 0).max(0) as usize)
+    });
+    load(h, cur_dir());
+    let list = ST.with_borrow(|st| st.list);
+    if !names.is_empty() {
+        let rows: Vec<String> = ST.with_borrow(|st| st.rows.iter().map(|r| r.name.clone()).collect());
+        let mut it: LVITEMW = unsafe { std::mem::zeroed() };
+        it.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+        put(list, LVM_SETITEMSTATE, usize::MAX, &it as *const _ as isize);
+        for name in &names {
+            if let Some(i) = rows.iter().position(|n| n.eq_ignore_ascii_case(name)) {
+                it.state = LVIS_SELECTED;
+                put(list, LVM_SETITEMSTATE, i, &it as *const _ as isize);
+            }
+        }
+    }
+    put(list, LVM_ENSUREVISIBLE, top, 0);
+    unsafe { ui::status_dirty(h) };
+}
 
 /// (list, current dir, full paths of the selected rows)
 fn selected() -> (HWND, PathBuf, Vec<PathBuf>) {
@@ -859,17 +1103,51 @@ fn tab_close_at(h: HWND, i: usize) {
 }
 
 fn toggle_view(h: HWND) {
-    let on = ST.with_borrow(|st| st.thumbs);
-    set_view(h, !on);
+    let view = ST.with_borrow(|st| st.view);
+    set_view(h, if view == ViewMode::Details { ViewMode::Large } else { ViewMode::Details });
 }
 
-/// Details (thumbs = false) or large thumbnails (thumbs = true), like Explorer's view menu.
-fn set_view(h: HWND, thumbs: bool) {
-    let (list, on) = ST.with_borrow_mut(|st| { st.thumbs = thumbs; (st.list, st.thumbs) });
-    THUMBS.store(on, Relaxed);
-    ui::row_height(list, !on);
-    put(list, LVM_SETVIEW, if on { LV_VIEW_ICON } else { LV_VIEW_DETAILS } as usize, 0);
+/// A thumbnail image list of `px` pixels for the icon views; rebuilt when the size changes.
+fn ensure_iml(list: HWND, px: i32) {
+    let (old, cur) = ST.with_borrow(|st| (st.himl, st.iml_px));
+    if cur == px && old != 0 { return; }
+    let new = unsafe { ImageList_Create(px, px, ILC_COLOR32, 64, 64) };
+    put(list, LVM_SETIMAGELIST, LVSIL_NORMAL as usize, new as isize);
+    if old != 0 { unsafe { ImageList_Destroy(old as _) }; }
+    ST.with_borrow_mut(|st| { st.himl = new as isize; st.iml_px = px; });
+    let gap = match px { 256 => 56, 96 => 34, 48 => 28, _ => 24 };
+    put(list, LVM_SETICONSPACING, 0, (((px + gap) as isize) << 16) | (px + gap) as isize);
+    reset_thumbs();
+}
+
+/// Applies a view mode to the list without reloading the folder (also used when a folder's saved view is restored).
+fn apply_view(list: HWND, view: ViewMode) {
+    ui::row_height(list, view == ViewMode::Details);
+    match view {
+        ViewMode::Details => { put(list, LVM_SETVIEW, LV_VIEW_DETAILS as usize, 0); }
+        ViewMode::List => { put(list, LVM_SETVIEW, LV_VIEW_LIST as usize, 0); }
+        ViewMode::Small => { put(list, LVM_SETVIEW, LV_VIEW_SMALLICON as usize, 0); }
+        ViewMode::Medium | ViewMode::Large | ViewMode::ExtraLarge => { ensure_iml(list, view.icon_px()); put(list, LVM_SETVIEW, LV_VIEW_ICON as usize, 0); }
+        ViewMode::Tiles => { ensure_iml(list, 48); put(list, LVM_SETVIEW, LV_VIEW_TILE as usize, 0); }
+    }
+}
+
+/// Details, list, the four icon sizes or tiles (the View menu and Ctrl+wheel).
+fn set_view(h: HWND, view: ViewMode) {
+    let list = ST.with_borrow_mut(|st| { st.view = view; st.thumbs = view != ViewMode::Details; st.list });
+    THUMBS.store(view != ViewMode::Details, Relaxed);
+    apply_view(list, view);
+    save_current_view(); // before the reload: load() restores this folder's saved view
     reload(h);
+}
+
+/// Ctrl+wheel: details -> list -> small / medium / large / extra large icons, and back.
+fn zoom_view(h: HWND, up: bool) {
+    let order = [ViewMode::Details, ViewMode::List, ViewMode::Small, ViewMode::Medium, ViewMode::Large, ViewMode::ExtraLarge];
+    let cur = ST.with_borrow(|st| st.view);
+    let i = order.iter().position(|&v| v == cur).unwrap_or(4);
+    let j = if up { (i + 1).min(order.len() - 1) } else { i.saturating_sub(1) };
+    if order[j] != cur { set_view(h, order[j]); }
 }
 
 /// Sorts the rows that are on screen (a folder or the hits of a search) and repaints.
@@ -877,10 +1155,11 @@ fn sort_now(h: HWND, c: usize, asc: bool) {
     SORT_COL.store(c, Relaxed);
     SORT_ASC.store(asc, Relaxed);
     let n = ST.with_borrow_mut(|st| {
-        st.rows.retain(|r| !r.hdr);
-        sort_rows(&mut st.rows, c, asc);
-        add_headers(&mut st.rows);
-        st.rows.iter_mut().for_each(|r| r.thumb = -2);
+        st.all.retain(|r| !r.hdr);
+        sort_rows(&mut st.all, c, asc);
+        add_headers(&mut st.all);
+        st.all.iter_mut().for_each(|r| r.thumb = -2);
+        st.rows = visible_rows(&st.all);
         st.rows.len()
     });
     reset_thumbs();
@@ -889,17 +1168,13 @@ fn sort_now(h: HWND, c: usize, asc: bool) {
     let hdr = put(list, LVM_GETHEADER, 0, 0) as HWND;
     if !hdr.is_null() { unsafe { InvalidateRect(hdr, ptr::null(), 0) }; }
     unsafe { ui::status_dirty(h) };
+    save_current_view();
 }
 
-/// "Group by date" on / off, then the rows are grouped again.
-fn group_now(h: HWND, on: bool) {
-    let k = group_marker();
-    if on {
-        if let Some(d) = k.parent() { let _ = fs::create_dir_all(d); }
-        let _ = fs::write(&k, "1");
-    } else {
-        let _ = fs::remove_file(&k);
-    }
+/// "Group by": 0 none, 1 date, 2 name, 3 type, 4 size; then the rows are grouped again.
+fn group_now(h: HWND, mode: usize) {
+    if GROUP.load(Relaxed) != mode { COLLAPSED.with_borrow_mut(|s| s.clear()); }
+    GROUP.store(mode, Relaxed);
     sort_now(h, SORT_COL.load(Relaxed), SORT_ASC.load(Relaxed));
 }
 
@@ -1101,16 +1376,16 @@ mod sh {
         }
     }
 
-    /// Background thumbnail loader: GetImage for each (era, row, path) asked for, result posted to the main window.
-    pub fn start_thumbs(main: isize) -> std::sync::mpsc::Sender<(u32, usize, PathBuf)> {
-        let (tx, rx) = std::sync::mpsc::channel::<(u32, usize, PathBuf)>();
+    /// Background thumbnail loader: GetImage for each (era, row, path, px) asked for, result posted to the main window.
+    pub fn start_thumbs(main: isize) -> std::sync::mpsc::Sender<(u32, usize, PathBuf, i32)> {
+        let (tx, rx) = std::sync::mpsc::channel::<(u32, usize, PathBuf, i32)>();
         std::thread::spawn(move || unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            for (era, row, path) in rx {
+            for (era, row, path, px) in rx {
                 if era != super::GEN.load(std::sync::atomic::Ordering::Relaxed) { continue; }
                 let Ok(f) = SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(PCWSTR(wide(&path).as_ptr()), None) else { continue };
-                let Ok(bmp) = f.GetImage(SIZE { cx: super::THUMB, cy: super::THUMB }, SIIGBF_BIGGERSIZEOK) else { continue };
-                let padded = pad(bmp.0);
+                let Ok(bmp) = f.GetImage(SIZE { cx: px, cy: px }, SIIGBF_BIGGERSIZEOK) else { continue };
+                let padded = pad(bmp.0, px);
                 windows_sys::Win32::Graphics::Gdi::DeleteObject(bmp.0 as _);
                 if padded.is_null() { continue; }
                 let b = Box::new((era, row, padded as isize));
@@ -1120,11 +1395,10 @@ mod sh {
         tx
     }
 
-    /// Centers `src` (any size up to THUMB, 32-bit with alpha) on a transparent THUMB x THUMB bitmap: ImageList_Add needs exact sizes.
-    unsafe fn pad(src: *mut c_void) -> *mut c_void {
+    /// Centers `src` (any size up to t, 32-bit with alpha) on a transparent t x t bitmap: ImageList_Add needs exact sizes.
+    unsafe fn pad(src: *mut c_void, t: i32) -> *mut c_void {
         use windows_sys::Win32::Graphics::Gdi::*;
         unsafe {
-            let t = super::THUMB;
             let mut bm: BITMAP = std::mem::zeroed();
             GetObjectW(src as _, size_of::<BITMAP>() as i32, &mut bm as *mut _ as _);
             let mut bi: BITMAPINFO = std::mem::zeroed();
@@ -1778,7 +2052,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 }
                 let view = if desk() { LVS_ICON } else { LVS_REPORT };
                 let list = CreateWindowExW(0, w("SysListView32").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | view | if desk() { 0 } else { LVS_OWNERDATA } | LVS_EDITLABELS | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS, 0, 0, 0, 0, h, 0 as _, inst, ptr::null());
-                put(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize);
+                put(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP) as isize);
                 let mut fi: SHFILEINFOW = std::mem::zeroed();
                 let il = SHGetFileInfoW(w("C:\\").as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
                 put(list, LVM_SETIMAGELIST, LVSIL_SMALL as usize, il as isize);
@@ -1803,9 +2077,9 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     put(list, LVM_SETIMAGELIST, LVSIL_NORMAL as usize, himl as isize);
                     put(list, LVM_SETICONSPACING, 0, ((THUMB as isize + 34) << 16) | (THUMB as isize + 24));
                     let _ = TX.set(sh::start_thumbs(h as isize));
-                    ST.with_borrow_mut(|st| st.himl = himl as isize);
+                    ST.with_borrow_mut(|st| { st.himl = himl as isize; st.iml_px = THUMB; });
                     // the same columns, in the same order, as Explorer's details view
-                    col(list, 0, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称"), ui::sc(360), false);
+                    col(list, 0, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称"), ui::sc(560), false);
                     col(list, 1, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期"), ui::sc(160), false);
                     col(list, 2, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型"), ui::sc(140), false);
                     col(list, 3, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"), ui::sc(96), true);
@@ -1918,11 +2192,23 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         _ => {}
                     },
                     60..=67 => sort_now(h, ((wp - 60) / 2) as usize, (wp - 60) % 2 == 0),
-                    70 | 72 => group_now(h, wp == 72),
-                    81 => set_view(h, true),
-                    85 => set_view(h, false),
+                    70..=74 => group_now(h, [0, 2, 1, 3, 4][(wp - 70) as usize]),
+                    80..=86 => { if let Some(v) = ViewMode::from_action(wp) { set_view(h, v); } }
+                    87 => zoom_view(h, lp > 0),
                     93 => toggle_checkboxes(),
+                    94 => { SHOW_EXT.fetch_xor(true, Relaxed); save_globals(); reload(h); }
                     95 => { SHOW_HIDDEN.fetch_xor(true, Relaxed); reload(h); }
+                    96 => {
+                        COMPACT.fetch_xor(true, Relaxed);
+                        save_globals();
+                        let (list, n) = ST.with_borrow(|st| (st.list, st.rows.len()));
+                        ui::row_height(list, !THUMBS.load(Relaxed));
+                        put(list, LVM_SETVIEW, LV_VIEW_LIST as usize, 0); // the row height is measured again only by a view change
+                        put(list, LVM_SETVIEW, LV_VIEW_DETAILS as usize, 0);
+                        put(list, LVM_SETITEMCOUNT, n, 0);
+                        put(list, LVM_REDRAWITEMS, 0, n as isize - 1);
+                        InvalidateRect(list, ptr::null(), 0);
+                    }
                     20 => { if let Some(p) = ui::nav_path(lp as usize) { load(h, p); } } // a folder in the left pane
                     21 => { if let Some(p) = ui::crumb_path(lp as usize) { load(h, p); } } // a part of the path in the address pill
                     _ => {}
@@ -1957,25 +2243,41 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             (0..len).map(|k| (start + k) % len).find(|&i| !st.rows[i].hdr && st.rows[i].name.to_lowercase().starts_with(&q)).map_or(-1, |i| i as isize)
                         });
                     }
+                    LVN_GETINFOTIPW => {
+                        // the tooltip over a row: name, type and size (the date too when there is room)
+                        let it = &mut *(lp as *mut NMLVGETINFOTIPW);
+                        let row = ST.with_borrow(|st| usize::try_from(it.iItem).ok().and_then(|i| st.rows.get(i)).filter(|r| !r.hdr).map(|r| (r.name.clone(), r.dir, r.size, r.time)));
+                        if let Some((name, dir, size, time)) = row {
+                            let mut s = shown_name(&name, false, dir);
+                            s.push_str("\r\n");
+                            s.push_str(&type_text(&name, dir));
+                            if !dir { s.push_str(&format!("  \u{00B7}  {}", size_text(size))); }
+                            let date = date_text(time);
+                            if !date.is_empty() { s.push_str(&format!("\r\n{date}")); }
+                            let u: Vec<u16> = s.encode_utf16().take(it.cchTextMax.max(1) as usize - 1).collect();
+                            ptr::copy_nonoverlapping(u.as_ptr(), it.pszText, u.len());
+                            *it.pszText.add(u.len()) = 0;
+                        }
+                    }
                     LVN_GETDISPINFOW => {
                         let it = &mut (*(lp as *mut NMLVDISPINFOW)).item;
                         // a request that arrives while ST is borrowed is skipped; the list repaints later
                         ST.with(|c| {
                             let Ok(mut st) = c.try_borrow_mut() else { return };
-                            let State { dir, rows, thumbs, .. } = &mut *st;
+                            let State { dir, rows, view, .. } = &mut *st;
                             let Some(i) = usize::try_from(it.iItem).ok() else { return };
                             let Some(r) = rows.get_mut(i) else { return };
                             if it.mask & LVIF_TEXT != 0 && it.cchTextMax > 0 {
-                                let s = if r.hdr { if it.iSubItem == 0 { r.name[1..].to_string() } else { String::new() } } else { match it.iSubItem { 0 => shown_name(&r.name, desk()), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir => String::new(), _ => size_text(r.size) } };
+                                let s = if r.hdr { if it.iSubItem == 0 { r.name[1..].to_string() } else { String::new() } } else { match it.iSubItem { 0 => shown_name(&r.name, desk(), r.dir), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir => String::new(), _ => size_text(r.size) } };
                                 let u: Vec<u16> = s.encode_utf16().take(it.cchTextMax as usize - 1).collect();
                                 ptr::copy_nonoverlapping(u.as_ptr(), it.pszText, u.len());
                                 *it.pszText.add(u.len()) = 0;
                             }
                             if r.hdr { if it.mask & LVIF_IMAGE != 0 { it.iImage = I_IMAGENONE; } return; }
-                            if it.mask & LVIF_IMAGE != 0 && *thumbs {
+                            if it.mask & LVIF_IMAGE != 0 && view.wants_thumbs() {
                                 if r.thumb == -2 {
                                     r.thumb = -1;
-                                    if let Some(tx) = TX.get() { let _ = tx.send((GEN.load(std::sync::atomic::Ordering::Relaxed), i, dir.join(&r.name))); }
+                                    if let Some(tx) = TX.get() { let _ = tx.send((GEN.load(std::sync::atomic::Ordering::Relaxed), i, dir.join(&r.name), view.icon_px())); }
                                 }
                                 it.iImage = if r.thumb >= 0 { r.thumb } else { I_IMAGENONE };
                             } else if it.mask & LVIF_IMAGE != 0 {
@@ -1988,6 +2290,13 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         let i = (*(lp as *const NMITEMACTIVATE)).iItem;
                         let hit = ST.with_borrow(|st| usize::try_from(i).ok().and_then(|i| st.rows.get(i)).filter(|r| !r.hdr).map(|r| (st.dir.join(&r.name), r.dir)));
                         if let Some((p, is_dir)) = hit { activate(h, p, is_dir); }
+                    }
+                    NM_CLICK if nm.hwndFrom == list => {
+                        // a group heading: fold its rows away, or bring them back
+                        let i = (*(lp as *const NMITEMACTIVATE)).iItem;
+                        if let Some(label) = ST.with_borrow(|st| st.rows.get(i as usize).filter(|r| r.hdr).map(|r| r.name[1..].to_string())) {
+                            toggle_group(h, &label);
+                        }
                     }
                     NM_RCLICK if nm.hwndFrom == list => {
                         // like Explorer: right click selects the row under the pointer (an already selected one keeps the
@@ -2106,7 +2415,18 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         let hdr = ST.with_borrow(|st| usize::try_from((*(lp as *const NMLVDISPINFOW)).item.iItem).ok().and_then(|i| st.rows.get(i)).is_some_and(|r| r.hdr));
                         if hdr { return 1; } // a heading cannot be renamed
                         let e = SendMessageW(ST.with_borrow(|st| st.list), LVM_GETEDITCONTROL, 0, 0) as HWND;
-                        if e != 0 as HWND { LABEL_OLD.store(SetWindowLongPtrW(e, GWLP_WNDPROC, label_proc as *const () as isize), std::sync::atomic::Ordering::Relaxed); }
+                        if e != 0 as HWND {
+                            LABEL_OLD.store(SetWindowLongPtrW(e, GWLP_WNDPROC, label_proc as *const () as isize), std::sync::atomic::Ordering::Relaxed);
+                            // extensions are hidden: the box starts with just the name selected, like Explorer
+                            if !SHOW_EXT.load(Relaxed) {
+                                let name = ST.with_borrow(|st| usize::try_from((*(lp as *const NMLVDISPINFOW)).item.iItem).ok().and_then(|i| st.rows.get(i)).map(|r| (r.name.rsplit('\\').next().unwrap_or(&r.name).to_string(), r.dir)));
+                                if let Some((file, false)) = name {
+                                    if let Some((stem, _)) = file.rsplit_once('.') {
+                                        if !stem.is_empty() { SendMessageW(e, EM_SETSEL, 0, stem.encode_utf16().count() as isize); }
+                                    }
+                                }
+                            }
+                        }
                     }
                     LVN_ENDLABELEDITW => {
                         let it = &(*(lp as *const NMLVDISPINFOW)).item;
@@ -2125,6 +2445,18 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             }
             WM_SETFOCUS => { SetFocus(ST.with_borrow(|st| st.list)); 0 }
             WM_APP => { reload(h); 0 }
+            WM_REFRESH if !desk() => { SetTimer(h, 9, 300, None); 0 } // debounce bursts of changes
+            WM_TIMER if !desk() && wp == 9 => {
+                let list = ST.with_borrow(|st| st.list);
+                let editing = SendMessageW(list, LVM_GETEDITCONTROL, 0, 0) as HWND;
+                if jobs::busy() || GetCapture() != 0 as HWND || !editing.is_null() {
+                    SetTimer(h, 9, 500, None);
+                } else {
+                    KillTimer(h, 9);
+                    reload_keep(h);
+                }
+                0
+            }
             shellwin::WM_SHELL_SELECT => { shell_select(h as isize, *Box::from_raw(lp as *mut PathBuf)); 0 }
             WM_JOB => {
                 let err = *Box::from_raw(wp as *mut Option<String>);
@@ -2225,6 +2557,12 @@ fn main() {
         }
         return;
     }
+    // the old marker file meant "group by date"; the view menu now keeps the grouping itself
+    let legacy = PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\group-by-date");
+    if legacy.exists() { GROUP.store(1, Relaxed); let _ = fs::remove_file(&legacy); }
+    let (compact, ext) = read_globals().unwrap_or((false, !hide_extensions()));
+    COMPACT.store(compact, Relaxed);
+    SHOW_EXT.store(ext, Relaxed); // the saved switch, or the Windows "Hide extensions for known file types" setting
     sh::init();
     unsafe {
         SetProcessDPIAware(); // sharp text at any scaling; every size below goes through ui::sc
@@ -2342,10 +2680,10 @@ mod tests {
 
     #[test]
     fn desktop_rows_show_file_names_without_shortcut_extensions() {
-        assert_eq!(shown_name(r"C:\Users\Public\Desktop\Steam.lnk", true), "Steam");
-        assert_eq!(shown_name("Notes.txt", true), "Notes.txt");
-        assert_eq!(shown_name(r"C:\x\Game.URL", true), "Game");
-        assert_eq!(shown_name(r"C:\x\Steam.lnk", false), r"C:\x\Steam.lnk");
+        assert_eq!(shown_name(r"C:\Users\Public\Desktop\Steam.lnk", true, false), "Steam");
+        assert_eq!(shown_name("Notes.txt", true, false), "Notes.txt");
+        assert_eq!(shown_name(r"C:\x\Game.URL", true, false), "Game");
+        assert_eq!(shown_name(r"C:\x\Steam.lnk", false, false), r"C:\x\Steam.lnk");
     }
 
     #[test]
@@ -2399,7 +2737,7 @@ mod tests {
     fn dates_are_formatted_and_zero_is_blank() {
         assert_eq!(date_text(0), "");
         let t = date_text(132_000_000_000_000_000); // some day in 2019, local time zone
-        assert!(t.len() == 16 && t.starts_with("20"), "{t}");
+        assert!(t.contains(':') && t.contains("19"), "{t}"); // a short date and a time, in the user's format
     }
 }
 

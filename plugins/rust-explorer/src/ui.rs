@@ -4,7 +4,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use super::*;
 use std::{cell::Cell, collections::HashMap, path::Path};
-use windows_sys::Win32::{Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*}, System::{LibraryLoader::{GetProcAddress, LoadLibraryW}, SystemInformation::GetTickCount64}, UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture, TRACKMOUSEEVENT, TME_LEAVE, TrackMouseEvent}};
+use windows_sys::Win32::{Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*}, System::{LibraryLoader::{GetProcAddress, LoadLibraryW}, SystemInformation::GetTickCount64}, UI::Input::KeyboardAndMouse::{GetFocus, GetKeyState, ReleaseCapture, SetCapture, TRACKMOUSEEVENT, TME_LEAVE, TrackMouseEvent, VK_CONTROL}};
 use winrust_common::{lang, Lang, t, tf};
 
 // The window follows the Windows 11 File Explorer look: the app light/dark theme from Windows, the accent from DWM.
@@ -236,7 +236,8 @@ pub const ROW_H: i32 = 28;
 /// Off for the thumbnail view, where a state image would take room next to every thumbnail.
 pub fn row_height(list: HWND, on: bool) {
     unsafe {
-        let il = if on { ImageList_Create(1, sc(ROW_H), ILC_COLOR32, 1, 1) as isize } else { 0 };
+        let h = if COMPACT.load(Relaxed) { 22 } else { ROW_H };
+        let il = if on { ImageList_Create(1, sc(h), ILC_COLOR32, 1, 1) as isize } else { 0 };
         let old = SendMessageW(list, LVM_SETIMAGELIST, LVSIL_STATE as usize, il);
         if old != 0 { ImageList_Destroy(old as _); }
     }
@@ -248,19 +249,6 @@ thread_local! {
 }
 
 /// "Today, 09:48" / "Yesterday, 21:50" for recent files, the plain date otherwise.
-fn friendly_date(ft: u64) -> String {
-    let s = date_text(ft);
-    let mut now: windows_sys::Win32::Foundation::FILETIME = unsafe { std::mem::zeroed() };
-    unsafe { windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime(&mut now) };
-    let now = (now.dwHighDateTime as u64) << 32 | now.dwLowDateTime as u64;
-    let (today, yest) = (date_text(now), date_text(now.saturating_sub(864_000_000_000))); // 24 h in 100 ns ticks
-    match s.get(..10) {
-        Some(d) if s.len() >= 16 && today.get(..10) == Some(d) => tf!("Сегодня, {}", "Today, {}", ja: "今日 {}", pt: "Hoje, {}", zh: "今天 {}", &s[11..]),
-        Some(d) if s.len() >= 16 && yest.get(..10) == Some(d) => tf!("Вчера, {}", "Yesterday, {}", ja: "昨日 {}", pt: "Ontem, {}", zh: "昨天 {}", &s[11..]),
-        _ => s,
-    }
-}
-
 /// "3 items" with the right plural: the status line counts rows and the selection.
 fn items_text(k: usize) -> String {
     match lang!() {
@@ -321,15 +309,20 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             FillRect(dc, &row_r, b);
             DeleteObject(b);
             if hdr {
-                // a date heading: only its name, never highlighted
+                // a group heading with the fold chevron, never highlighted
                 let x0 = r.left;
                 if FONTS.get().0 == 0 { FONTS.set((font(13, 400, ui_face()), font(12, 400, ui_face()))); }
                 SetBkMode(dc, TRANSPARENT as i32);
-                let f_head = font(13, 600, ui_face()) as HFONT;
-                let of = SelectObject(dc, f_head);
-                text(dc, &name[1..], rc(x0 + sc(16), r.top + sc(4), cr.right, r.bottom), pal().text, DT_LEFT);
+                let label = &name[1..];
+                let collapsed = crate::group_collapsed(label);
+                let (f_head, f_ch) = (font(13, 600, ui_face()) as HFONT, font(11, 400, winrust_common::style::icon_face()) as HFONT);
+                let of = SelectObject(dc, f_ch);
+                text(dc, if collapsed { "\u{E76C}" } else { "\u{E70D}" }, rc(x0 + sc(6), r.top, x0 + sc(24), r.bottom), pal().dim, DT_CENTER);
+                SelectObject(dc, f_head);
+                text(dc, label, rc(x0 + sc(26), r.top + sc(4), cr.right, r.bottom), pal().text, DT_LEFT);
                 SelectObject(dc, of);
                 DeleteObject(f_head);
+                DeleteObject(f_ch);
                 return CDRF_SKIPDEFAULT as isize;
             }
             let sel = SendMessageW(list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) as u32 & LVIS_SELECTED != 0;
@@ -355,11 +348,12 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             let of = SelectObject(dc, f_name as HFONT);
             let p = Path::new(&name);
             let hit_of_search = p.is_absolute(); // search hits are absolute paths: the name column shows just the file name
-            let shown = if hit_of_search { p.file_name().map_or(name.clone(), |n| n.to_string_lossy().into_owned()) } else { name.clone() };
+            let shown = if hit_of_search { p.file_name().map_or(name.clone(), |n| n.to_string_lossy().into_owned()) } else { crate::shown_name(&name, false, is_dir) };
+            let shown = if hit_of_search { crate::shown_name(&shown, false, is_dir) } else { shown };
             text(dc, &shown, rc(x[0] + sc(16) + iw + sc(12), r.top, x[1] - sc(8), r.bottom), pal().text, DT_LEFT);
             SelectObject(dc, f_det as HFONT);
             let dim = if sel { mix(pal().dim, pal().text, 0.45) } else { pal().dim };
-            text(dc, &friendly_date(time), rc(x[1] + sc(10), r.top, x[2] - sc(8), r.bottom), dim, DT_LEFT);
+            text(dc, &date_text(time), rc(x[1] + sc(10), r.top, x[2] - sc(8), r.bottom), dim, DT_LEFT);
             let kind = type_text(&name, is_dir);
             text(dc, &kind, rc(x[2] + sc(10), r.top, x[3] - sc(8), r.bottom), dim, DT_LEFT | DT_PATH_ELLIPSIS);
             if !is_dir { text(dc, &size_text(size), rc(x[3], r.top, x[3] + cw[3] - sc(14), r.bottom), dim, DT_RIGHT); }
@@ -368,14 +362,6 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
         }
         _ => CDRF_DODEFAULT as isize,
     }
-}
-
-/// Name column takes what the other three leave, so the list never needs a horizontal scrollbar.
-pub unsafe fn fit_columns(list: HWND) {
-    let mut cr: RECT = std::mem::zeroed();
-    GetClientRect(list, &mut cr);
-    let rest: i32 = (1..4).map(|k| SendMessageW(list, LVM_GETCOLUMNWIDTH, k, 0) as i32).sum();
-    SendMessageW(list, LVM_SETCOLUMNWIDTH, 0, (cr.right - rest).clamp(sc(200), sc(560)) as isize);
 }
 
 /// Repaints one row (hover moved on or off it).
@@ -392,6 +378,11 @@ unsafe fn redraw_row(list: HWND, i: isize) {
 /// Column header, drawn by hand: bar colour, white / dim title, a sort arrow on the sorted column. The header reports its
 /// custom draw to its parent, the list, so the hook sits on the list.
 unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    if m == WM_MOUSEWHEEL && GetKeyState(VK_CONTROL as i32) < 0 {
+        let d = ((wp >> 16) & 0xFFFF) as i16;
+        if d != 0 { PostMessageW(GetAncestor(h, GA_ROOT), WM_UI, 87, if d > 0 { 1 } else { -1 }); }
+        return 0;
+    }
     if m == WM_MOUSEMOVE {
         // hover row for list_draw
         let mut ht: LVHITTESTINFO = std::mem::zeroed();
@@ -412,6 +403,17 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
     if m == WM_NOTIFY {
         let nm = &*(lp as *const NMCUSTOMDRAW);
         let hdr = SendMessageW(h, LVM_GETHEADER, 0, 0) as HWND;
+        if nm.hdr.hwndFrom == hdr {
+            use windows_sys::Win32::UI::Controls::{HDN_DIVIDERDBLCLICKW, HDN_ENDTRACKW, NMHEADERW};
+            if nm.hdr.code == HDN_ENDTRACKW {
+                crate::save_current_view(); // the folder remembers its column widths
+            } else if nm.hdr.code == HDN_DIVIDERDBLCLICKW {
+                let i = (*(lp as *const NMHEADERW)).iItem as usize;
+                SendMessageW(h, LVM_SETCOLUMNWIDTH, i, LVSCW_AUTOSIZE_USEHEADER as isize);
+                crate::save_current_view();
+                return 0;
+            }
+        }
         if nm.hdr.hwndFrom == hdr && nm.hdr.code == NM_CUSTOMDRAW {
             return match nm.dwDrawStage {
                 CDDS_PREPAINT => {
@@ -921,33 +923,41 @@ unsafe fn sort_menu(h: HWND, at: RECT) {
 
 unsafe fn view_menu(h: HWND, at: RECT) {
     let m = CreatePopupMenu();
+    let view = ST.with_borrow(|s| s.view);
+    let g = GROUP.load(Relaxed);
+    let compact = COMPACT.load(Relaxed);
+    let ext = SHOW_EXT.load(Relaxed);
+    let checks = {
+        let list = ST.with_borrow(|s| s.list);
+        SendMessageW(list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) as isize & LVS_EX_CHECKBOXES as isize != 0
+    };
     let add = |m: HMENU, id: usize, label: String, enabled: bool, checked: bool| {
         let flags = MF_STRING | if enabled { 0 } else { MF_GRAYED } | if checked { MF_CHECKED } else { 0 };
         AppendMenuW(m, flags, id, w(&label).as_ptr());
     };
-    add(m, 80, t!("Очень крупные значки", "Extra large icons", ja: "特大アイコン", pt: "Ícones extragrandes", zh: "超大图标").into(), false, false);
-    add(m, 81, t!("Крупные значки", "Large icons", ja: "大アイコン", pt: "Ícones grandes", zh: "大图标").into(), true, ST.with_borrow(|s| s.thumbs));
-    add(m, 82, t!("Обычные значки", "Medium icons", ja: "中アイコン", pt: "Ícones médios", zh: "中等图标").into(), false, false);
-    add(m, 83, t!("Мелкие значки", "Small icons", ja: "小アイコン", pt: "Ícones pequenos", zh: "小图标").into(), false, false);
-    add(m, 84, t!("Список", "List", ja: "一覧", pt: "Lista", zh: "列表").into(), false, false);
-    add(m, 85, t!("Таблица", "Details", ja: "詳細", pt: "Detalhes", zh: "详细信息").into(), true, !ST.with_borrow(|s| s.thumbs));
-    add(m, 86, t!("Плитка", "Tiles", ja: "タイル", pt: "Blocos", zh: "平铺").into(), false, false);
+    add(m, 80, t!("Очень крупные значки", "Extra large icons", ja: "特大アイコン", pt: "Ícones extragrandes", zh: "超大图标").into(), true, view == ViewMode::ExtraLarge);
+    add(m, 81, t!("Крупные значки", "Large icons", ja: "大アイコン", pt: "Ícones grandes", zh: "大图标").into(), true, view == ViewMode::Large);
+    add(m, 82, t!("Обычные значки", "Medium icons", ja: "中アイコン", pt: "Ícones médios", zh: "中等图标").into(), true, view == ViewMode::Medium);
+    add(m, 83, t!("Мелкие значки", "Small icons", ja: "小アイコン", pt: "Ícones pequenos", zh: "小图标").into(), true, view == ViewMode::Small);
+    add(m, 84, t!("Список", "List", ja: "一覧", pt: "Lista", zh: "列表").into(), true, view == ViewMode::List);
+    add(m, 85, t!("Таблица", "Details", ja: "詳細", pt: "Detalhes", zh: "详细信息").into(), true, view == ViewMode::Details);
+    add(m, 86, t!("Плитка", "Tiles", ja: "タイル", pt: "Blocos", zh: "平铺").into(), true, view == ViewMode::Tiles);
     AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
     let show = CreatePopupMenu();
     add(show, 90, t!("Область переходов", "Navigation pane", ja: "ナビゲーション ウィンドウ", pt: "Painel de navegação", zh: "导航窗格").into(), false, true);
     add(show, 91, t!("Область предпросмотра", "Preview pane", ja: "プレビュー ウィンドウ", pt: "Painel de visualização", zh: "预览窗格").into(), false, false);
     add(show, 92, t!("Область сведений", "Details pane", ja: "詳細ウィンドウ", pt: "Painel de detalhes", zh: "详细信息窗格").into(), false, false);
-    add(show, 93, t!("Флажки элементов", "Item check boxes", ja: "項目のチェック ボックス", pt: "Caixas de seleção de itens", zh: "项目复选框").into(), true, false);
-    add(show, 94, t!("Расширения имён файлов", "File name extensions", ja: "ファイル名拡張子", pt: "Extensões de nome de arquivo", zh: "文件扩展名").into(), false, false);
+    add(show, 93, t!("Флажки элементов", "Item check boxes", ja: "項目のチェック ボックス", pt: "Caixas de seleção de itens", zh: "项目复选框").into(), true, checks);
+    add(show, 94, t!("Расширения имён файлов", "File name extensions", ja: "ファイル名拡張子", pt: "Extensões de nome de arquivo", zh: "文件扩展名").into(), true, ext);
     add(show, 95, t!("Скрытые элементы", "Hidden items", ja: "隠しファイル", pt: "Itens ocultos", zh: "隐藏的项目").into(), true, SHOW_HIDDEN.load(Relaxed));
-    add(show, 96, t!("Компактный вид", "Compact view", ja: "コンパクト表示", pt: "Exibição compacta", zh: "紧凑视图").into(), false, false);
+    add(show, 96, t!("Компактный вид", "Compact view", ja: "コンパクト表示", pt: "Exibição compacta", zh: "紧凑视图").into(), true, compact);
     AppendMenuW(m, MF_POPUP | MF_STRING, show as usize, w(t!("Показать", "Show", ja: "表示", pt: "Mostrar", zh: "显示")).as_ptr());
     let group = CreatePopupMenu();
-    add(group, 70, t!("Нет", "(None)", ja: "なし", pt: "(Nenhum)", zh: "(无)").into(), true, !group_on());
-    add(group, 71, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称").into(), false, false);
-    add(group, 72, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期").into(), true, group_on());
-    add(group, 73, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型").into(), false, false);
-    add(group, 74, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小").into(), false, false);
+    add(group, 70, t!("Нет", "(None)", ja: "なし", pt: "(Nenhum)", zh: "(无)").into(), true, g == 0);
+    add(group, 71, t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称").into(), true, g == 2);
+    add(group, 72, t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期").into(), true, g == 1);
+    add(group, 73, t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型").into(), true, g == 3);
+    add(group, 74, t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小").into(), true, g == 4);
     AppendMenuW(m, MF_POPUP | MF_STRING, group as usize, w(t!("Группировать", "Group by", ja: "グループ化", pt: "Agrupar por", zh: "分组依据")).as_ptr());
     let mut pt = POINT { x: at.left, y: at.bottom + sc(2) };
     ClientToScreen(h, &mut pt);
@@ -1264,7 +1274,6 @@ pub unsafe fn layout_children(cw: i32, ch: i32) {
     MoveWindow(chrome, 0, 0, cw, top, 1);
     MoveWindow(nav, 0, top, nw, h, 1);
     MoveWindow(list, nw, top, cw - nw, h, 1);
-    fit_columns(list);
 }
 
 /// Item under y (None over headings or empty space).
