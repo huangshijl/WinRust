@@ -617,7 +617,10 @@ fn zip_menu(h: HWND, paths: &[PathBuf]) {
 /// The shell menu for the selection, with our "Compress to ZIP" / "Extract here" on top.
 fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
     if zipx::split_zip(dir).is_some() { return zip_menu(h, paths); }
-    if cur_virtual() { let _ = sh::show(h, paths, &[]); reload(h); return; } // drives and quick access folders get their own shell menu
+    if cur_virtual() { // drives and quick access folders get their own shell menu
+        if sh::show(h, paths, &[]).ok().flatten().is_some() { reload_keep(h); }
+        return;
+    }
     let mut extra = vec![(MENU_ZIP, t!("Сжать в ZIP", "Compress to ZIP", ja: "ZIP に圧縮", pt: "Compactar em ZIP", zh: "压缩为 ZIP"))];
     if paths.iter().all(|p| p.is_file() && jobs::is_archive(p)) {
         extra.insert(0, (MENU_EXTRACT, t!("Извлечь сюда", "Extract here", ja: "ここに展開", pt: "Extrair aqui", zh: "解压到此处")));
@@ -642,7 +645,8 @@ fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
             jobs::zip(h as isize, paths.to_vec(), dest);
         }
         Some(MENU_EXTRACT) => _ = jobs::extract(h as isize, paths.to_vec(), dir.to_path_buf()),
-        _ => reload(h),
+        Some(_) => reload_keep(h), // a shell verb ran: refresh, keeping the selection and the scroll position
+        None => {}                 // dismissed (blank click / Esc): nothing changed, and the list must not jump to the top
     }
 }
 

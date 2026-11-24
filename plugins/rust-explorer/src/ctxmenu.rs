@@ -728,8 +728,10 @@ unsafe fn show_inner(parent: HWND, items: Vec<Item>, at: POINT) -> Pick {
     st.layout();
     STATE.with_borrow_mut(|s| *s = Some(st));
     STATE.with_borrow_mut(|s| if let Some(s) = s.as_mut() { s.initial_hot(); });
+    // layout() has already sized the card and slid it inside the monitor: show it there, never at the raw click point
+    // first (that made every menu near an edge flash outside the screen and jump back)
     ShowWindow(menu, SW_SHOWNA);
-    SetWindowPos(menu, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowPos(menu, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     SetCapture(menu);
     SetFocus(menu);
     let hook = SetWindowsHookExW(WH_GETMESSAGE, Some(hook_proc), ptr::null_mut(), GetCurrentThreadId());
