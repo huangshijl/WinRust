@@ -135,7 +135,7 @@ fn now() -> u64 { unsafe { GetTickCount64() } }
 
 fn ease(t: f32) -> f32 { t * t * (3.0 - 2.0 * t) }
 
-fn mix(a: u32, b: u32, t: f32) -> u32 {
+pub(crate) fn mix(a: u32, b: u32, t: f32) -> u32 {
     let ch = |s: u32| {
         let (x, y) = (((a >> s) & 255) as f32, ((b >> s) & 255) as f32);
         (x + (y - x) * t) as u32
@@ -611,7 +611,7 @@ pub fn gdiplus_start() {
 }
 
 /// Fills `r` (right / bottom exclusive) in `c`; `rad` > 0 rounds the corners (rad = corner diameter), anti-aliased.
-unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
+pub(crate) unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
     use windows_sys::Win32::Graphics::GdiPlus::*;
     let (wd, ht) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
     if wd <= 0.0 || ht <= 0.0 { return; }
@@ -647,7 +647,7 @@ unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
     GdipDeleteGraphics(g);
 }
 
-unsafe fn text(dc: HDC, s: &str, mut r: RECT, c: u32, flags: u32) {
+pub(crate) unsafe fn text(dc: HDC, s: &str, mut r: RECT, c: u32, flags: u32) {
     SetTextColor(dc, c);
     DrawTextW(dc, w(s).as_ptr(), -1, &mut r, flags | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
 }

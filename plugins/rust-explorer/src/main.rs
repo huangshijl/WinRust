@@ -1,6 +1,6 @@
 // rust-explorer [path]  — file manager window (Explorer replacement).
 // Virtual list (LVS_OWNERDATA, only visible rows are asked for text/icon), system icons, tabs,
-// IFileOperation (recycle bin / undo / elevation prompts), real shell context menu with submenus, OLE drag and drop.
+// IFileOperation (recycle bin / undo / elevation prompts), the Win11-style multi-column context menu (ctxmenu.rs), OLE drag and drop.
 // Keys: Enter open, Backspace up, F2 rename, Del recycle, Ctrl+C/X/V copy/cut/paste, Ctrl+N new folder,
 // Ctrl+T/W/Tab tabs, Ctrl+M thumbnails, Ctrl+L/F4 address bar, Ctrl+F or "? terms" in the bar = instant search through the rs service, right click / Menu key = shell context menu.
 // Look: topbar's palette, painted tabs / toolbar / address pill and status line (src/ui.rs), dark title bar and list.
@@ -24,6 +24,7 @@ use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{GetStockObject, Invalida
 mod zipx; // our own ZIP engine (deflate, inflate, container)
 mod jobs; // our own copier, ZIP packer, ZIP/7z unpacker (background, progress in the status line)
 mod shellwin; // registers the window as a shell window: "Show in folder" from other apps selects the file
+mod ctxmenu; // the Win11-style multi-column context menu (shell items laid out to the right of the click)
 mod ui; // the look: palette, painted tabs / toolbar / address pill / status line, dark theme
 
 static DESKTOP: AtomicBool = AtomicBool::new(false);
@@ -1797,6 +1798,114 @@ mod sh {
         });
     }
 
+    /// The items the custom menu shows: the shell's own menu, our extras (already in `menu`), and "Show more options".
+    unsafe fn model(cm: &IContextMenu, menu: HMENU) -> Vec<crate::ctxmenu::Item> {
+        use windows::Win32::Graphics::Gdi::{GetObjectW, BITMAP, HGDIOBJ};
+        use windows::Win32::UI::WindowsAndMessaging::{GetMenuItemCount, GetMenuItemID, GetMenuItemInfoW, GetSubMenu, MENUITEMINFOW,
+            MFS_CHECKED, MFS_DEFAULT, MFS_DISABLED, MFS_GRAYED, MFT_RADIOCHECK, MFT_SEPARATOR,
+            MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU};
+        fn glyph(id: u32, verb: &str) -> &'static str {
+            match id {
+                crate::MENU_ZIP => return "\u{E7B8}",
+                crate::MENU_EXTRACT => return "\u{E838}",
+                crate::MENU_RENAME => return "\u{E8AC}",
+                crate::MENU_PIN => return "\u{E840}",
+                _ => {}
+            }
+            match verb.to_ascii_lowercase().as_str() {
+                "open" => "\u{E8E5}",
+                "opennew" | "opennewwindow" => "\u{E8A7}",
+                "edit" => "\u{E70F}",
+                "print" | "printto" => "\u{E749}",
+                "cut" => "\u{E8C6}",
+                "copy" => "\u{E8C8}",
+                "paste" => "\u{E77F}",
+                "link" => "\u{E71B}",
+                "delete" => "\u{E74D}",
+                "rename" => "\u{E8AC}",
+                "properties" => "\u{E946}",
+                "sendto" => "\u{E724}",
+                "pintostartscreen" => "\u{E840}",
+                "openwith" => "\u{E7AC}",
+                "previousversions" => "\u{E81C}",
+                "share" => "\u{E72D}",
+                "runas" => "\u{E72E}",
+                _ => "",
+            }
+        }
+        fn read(cm: &IContextMenu, m: HMENU, depth: usize) -> Vec<crate::ctxmenu::Item> {
+            use windows::core::PWSTR;
+            let mut out = Vec::new();
+            if depth > 6 { return out; }
+            unsafe {
+                for i in 0..GetMenuItemCount(Some(m)).max(0) {
+                    let mut buf = [0u16; 512];
+                    let mut mi = MENUITEMINFOW { cbSize: size_of::<MENUITEMINFOW>() as u32,
+                        fMask: MIIM_ID | MIIM_STRING | MIIM_FTYPE | MIIM_STATE | MIIM_SUBMENU | MIIM_BITMAP,
+                        dwTypeData: PWSTR(buf.as_mut_ptr()), cch: buf.len() as u32, ..Default::default() };
+                    if GetMenuItemInfoW(m, i as u32, true.into(), &mut mi).is_err() { continue; }
+                    if mi.fType.0 & MFT_SEPARATOR.0 != 0 { out.push(crate::ctxmenu::Item::separator()); continue; }
+                    let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
+                    let raw = String::from_utf16_lossy(&buf[..n]);
+                    let id = GetMenuItemID(m, i as i32);
+                    let mut verb = [0u16; 128];
+                    let v = if id > 0 && id != u32::MAX && cm.GetCommandString(id as usize - 1, GCS_VERBW, None, PSTR(verb.as_mut_ptr() as *mut u8), verb.len() as u32).is_ok() {
+                        let k = verb.iter().position(|&c| c == 0).unwrap_or(0);
+                        String::from_utf16_lossy(&verb[..k])
+                    } else { String::new() };
+                    let sub_menu = GetSubMenu(m, i as i32);
+                    let sub = if !sub_menu.is_invalid() {
+                        CM2.with_borrow(|c| c.as_ref().is_some_and(|c| c.HandleMenuMsg(0x0117, WPARAM(sub_menu.0 as usize), LPARAM(i as isize)).is_ok()));
+                        read(cm, sub_menu, depth + 1)
+                    } else { Vec::new() };
+                    let (mut hbmp, mut bmp) = (0isize, (0, 0, 0));
+                    if !mi.hbmpItem.0.is_null() {
+                        let mut bm = BITMAP::default();
+                        if GetObjectW(HGDIOBJ(mi.hbmpItem.0), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut _)) != 0 && bm.bmWidth > 0 && bm.bmWidth <= 256 {
+                            hbmp = mi.hbmpItem.0 as isize;
+                            bmp = (bm.bmWidth, bm.bmHeight, bm.bmBitsPixel as i32);
+                        }
+                    }
+                    let (text, accel, hint) = crate::ctxmenu::Item::split_label(&raw);
+                    let (text, accel) = if text.is_empty() && accel.is_none() && !v.is_empty() { (v.clone(), None) } else { (text, accel) };
+                    out.push(crate::ctxmenu::Item {
+                        id, text, hint, accel,
+                        disabled: mi.fState.0 & (MFS_DISABLED.0 | MFS_GRAYED.0) != 0,
+                        checked: mi.fState.0 & MFS_CHECKED.0 != 0,
+                        radio: mi.fType.0 & MFT_RADIOCHECK.0 != 0,
+                        default: mi.fState.0 & MFS_DEFAULT.0 != 0,
+                        sep: false,
+                        glyph: glyph(id, &v),
+                        hbmp, bmp, sub,
+                    });
+                }
+            }
+            out
+        }
+        let mut items = read(cm, menu, 0);
+        let more = { use winrust_common::t; t!("Показать дополнительные параметры", "Show more options", ja: "その他のオプションを表示", pt: "Mostrar mais opções", zh: "显示更多选项") };
+        items.push(crate::ctxmenu::Item::separator());
+        items.push(crate::ctxmenu::Item { id: crate::ctxmenu::MORE, text: more.into(), glyph: "\u{E712}", ..Default::default() });
+        items
+    }
+
+    unsafe fn invoke(cm: &IContextMenu, hwnd: HWND, id: i32, pt: POINT) -> Result<()> {
+        // ptInvoke: without it dialogs the shell opens ("Open with" > choose another app) land off screen
+        let ci = CMINVOKECOMMANDINFOEX {
+            cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
+            fMask: CMIC_MASK_PTINVOKE,
+            hwnd,
+            lpVerb: PCSTR((id - 1) as usize as *const u8),
+            nShow: SW_SHOWNORMAL.0,
+            ptInvoke: pt,
+            ..Default::default()
+        };
+        let before = top_windows();
+        unsafe { cm.InvokeCommand(&ci as *const _ as *const CMINVOKECOMMANDINFO)?; }
+        keep_on_screen(before);
+        Ok(())
+    }
+
     pub fn show(h: *mut c_void, paths: &[PathBuf], extra: &[(u32, &str)]) -> Result<Option<u32>> {
         unsafe {
             let hwnd = HWND(h);
@@ -1815,27 +1924,27 @@ mod sh {
             CM2.set(cm.cast::<IContextMenu2>().ok());
             let mut pt = POINT::default();
             GetCursorPos(&mut pt)?;
-            let id = TrackPopupMenuEx(menu, TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0, pt.x, pt.y, hwnd, None).0;
+            let items = model(&cm, menu);
+            let pick = crate::ctxmenu::show(h, items, (pt.x, pt.y));
             CM2.set(None);
-            if extra.iter().any(|e| e.0 as i32 == id) {
+            let id = match pick { crate::ctxmenu::Pick::Id(id) => id, _ => 0 };
+            if id == crate::ctxmenu::MORE {
+                CM2.set(cm.cast::<IContextMenu2>().ok());
+                let id = TrackPopupMenuEx(menu, TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0, pt.x, pt.y, hwnd, None).0;
+                CM2.set(None);
+                if let Some(e) = extra.iter().find(|e| e.0 as i32 == id) {
+                    DestroyMenu(menu)?;
+                    return Ok(Some(e.0));
+                }
+                if id > 0 { invoke(&cm, hwnd, id, pt)?; }
                 DestroyMenu(menu)?;
-                return Ok(Some(id as u32));
+                return Ok(None);
             }
-            if id > 0 {
-                // ptInvoke: without it dialogs the shell opens ("Open with" > choose another app) land off screen
-                let ci = CMINVOKECOMMANDINFOEX {
-                    cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-                    fMask: CMIC_MASK_PTINVOKE,
-                    hwnd,
-                    lpVerb: PCSTR((id - 1) as usize as *const u8),
-                    nShow: SW_SHOWNORMAL.0,
-                    ptInvoke: pt,
-                    ..Default::default()
-                };
-                let before = top_windows();
-                cm.InvokeCommand(&ci as *const _ as *const CMINVOKECOMMANDINFO)?;
-                keep_on_screen(before);
+            if extra.iter().any(|e| e.0 == id) {
+                DestroyMenu(menu)?;
+                return Ok(Some(id));
             }
+            if id > 0 { invoke(&cm, hwnd, id as i32, pt)?; }
             DestroyMenu(menu)?;
             Ok(None)
         }
