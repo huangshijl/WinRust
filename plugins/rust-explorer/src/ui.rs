@@ -99,6 +99,7 @@ thread_local! {
 pub fn set_search(q: Option<String>) { SEARCHING.set(q); }
 
 pub fn searching() -> bool { SEARCHING.with_borrow(|s| s.is_some()) }
+pub fn search_text() -> Option<String> { SEARCHING.with_borrow(|s| s.clone()) }
 
 /// Folder of the path part `i` of the address pill.
 pub fn crumb_path(i: usize) -> Option<PathBuf> { CRUMBS.with_borrow(|c| c.get(i).map(|x| x.1.clone())) }
@@ -848,6 +849,7 @@ unsafe fn paint_chrome(hwnd: HWND) {
     // everything painting needs from the window state, copied out so nothing is borrowed while drawing
     let snap = ST.with(|c| c.try_borrow().ok().map(|s| (s.tabs.iter().map(label).collect::<Vec<_>>(), s.active, s.hist.pos > 0, s.hist.pos + 1 < s.hist.v.len(), s.edit, s.search, s.dir.clone(), s.dir.to_string_lossy().starts_with("::"))));
     let Some((tab_labels, active, can_back, can_fwd, edit, search, dir, virt)) = snap else { EndPaint(hwnd, &ps); return };
+    let can_up = dir.to_string_lossy() != "::home";
     BUSY.set(false);
     let (dc, bmp) = (CreateCompatibleDC(wdc), CreateCompatibleBitmap(wdc, cr.right, cr.bottom));
     let old = SelectObject(dc, bmp);
@@ -909,7 +911,7 @@ unsafe fn paint_chrome(hwnd: HWND) {
 
     // navigation buttons
     SelectObject(dc, f_glyph);
-    for (k, r, g, enabled) in [(BACK, l.back, "\u{E72B}", can_back), (FWD, l.fwd, "\u{E72A}", can_fwd), (UP, l.up, "\u{E74A}", true), (RELOAD, l.reload, "\u{E72C}", true)] {
+    for (k, r, g, enabled) in [(BACK, l.back, "\u{E72B}", can_back), (FWD, l.fwd, "\u{E72A}", can_fwd), (UP, l.up, "\u{E74A}", can_up), (RELOAD, l.reload, "\u{E72C}", true)] {
         if enabled { glow(dc, k, r, pal().bg, pal().hover, sc(4), hot == k); }
         text(dc, g, r, if enabled { pal().text } else { off() }, DT_CENTER);
     }

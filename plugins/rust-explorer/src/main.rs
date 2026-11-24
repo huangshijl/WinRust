@@ -30,6 +30,7 @@ mod ui; // the look: palette, painted tabs / toolbar / address pill / status lin
 mod cfg; // settings.ini: the window place, the show switches, per-folder views, folded sections
 mod hotkey; // Win+E: a resident copy of this exe hooks the key and starts the real one
 mod settings; // the gear's popup: preferences with their own window
+mod everything; // search through the running Everything over its WM_COPYDATA IPC
 
 static DESKTOP: AtomicBool = AtomicBool::new(false);
 fn desk() -> bool { DESKTOP.load(Relaxed) }
@@ -768,7 +769,7 @@ unsafe fn bg_menu(h: HWND) {
             items.push(ctxmenu::Item { id: 2, text: t!("Очистить корзину", "Empty Recycle Bin", ja: "ごみ箱を空にする", pt: "Esvaziar Lixeira", zh: "清空回收站").into(), glyph: "\u{E74D}", ..Default::default() });
         }
         match ctxmenu::show(h, items, (pt.x, pt.y)) {
-            ctxmenu::Pick::Id(1) => reload(h),
+            ctxmenu::Pick::Id(1) => refresh_after_ops(h),
             ctxmenu::Pick::Id(2) => recycle_empty(h),
             _ => {}
         }
@@ -913,7 +914,7 @@ unsafe fn bg_menu(h: HWND) {
         5 => properties(&dir),
         _ => {}
     }
-    if id != 0 { reload(h); }
+    if id != 0 { refresh_after_ops(h); }
 }
 
 /// Command line -> (folder to open, file to select there). Understands `/select,"C:\a\b.txt"` (what browsers and other
@@ -1183,13 +1184,13 @@ fn recycle_restore_original(h: HWND, original: &Path) -> bool {
 
 fn recycle_restore_selected(h: HWND) {
     for (target, origin, dir) in recycle_selected() { recycle_restore_one(h, &target, &origin, dir); }
-    reload(h);
+    refresh_after_ops(h);
 }
 
 fn recycle_restore_all(h: HWND) {
     let rows: Vec<(PathBuf, PathBuf, bool)> = ST.with_borrow(|st| st.rows.iter().filter(|r| !r.hdr).filter_map(|r| Some((r.target.clone()?, r.origin.clone()?, r.dir))).collect());
     for (target, origin, dir) in rows { recycle_restore_one(h, &target, &origin, dir); }
-    reload(h);
+    refresh_after_ops(h);
 }
 
 fn recycle_delete_selected(h: HWND) {
@@ -1202,12 +1203,12 @@ fn recycle_delete_selected(h: HWND) {
         if let Err(e) = r { warn(h, &format!("{}: {e}", target.display())); }
         if let Some(meta) = recycle_meta(&target) { let _ = fs::remove_file(meta); }
     }
-    reload(h);
+    refresh_after_ops(h);
 }
 
 fn recycle_empty(h: HWND) {
     unsafe { SHEmptyRecycleBinW(h, ptr::null(), 0) };
-    reload(h);
+    refresh_after_ops(h);
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -1366,21 +1367,46 @@ fn ask(d: char, q: &str) -> Option<String> {
 /// onto the current dir still yields the right file. Blocks the UI for the duration of the query (fast).
 /// Never call with ST borrowed.
 fn search(h: HWND, q: &str) {
+    // Everything first (it is the index the user asked for); without it the rust-search services, then a local walk
+    everything::ensure_started();
     let mut rows = vec![];
-    let mut indexed = false; // some drive had a rust-search service
-    for d in 'A'..='Z' {
-        let Some(reply) = ask(d, q) else { continue };
-        indexed = true;
-        for line in reply.lines() {
-            if line.starts_with("... ") { continue; }
-            let m = fs::metadata(line).ok();
-            rows.push(row(line.to_string(), m.as_ref()));
+    if let Some(hits) = everything::search(q, 2000) {
+        // target = the absolute path: the Name column shows where each hit is (the hits come from every drive)
+        rows = hits.into_iter().map(|x| Row {
+            name: x.path.to_string_lossy().into_owned(),
+            origin: None, target: Some(x.path), kind: None,
+            dir: x.dir, size: x.size, time: x.modified,
+            icon: -1, thumb: -2, hdr: false,
+        }).collect();
+    } else {
+        let mut indexed = false; // some drive had a rust-search service
+        for d in 'A'..='Z' {
+            let Some(reply) = ask(d, q) else { continue };
+            indexed = true;
+            for line in reply.lines() {
+                if line.starts_with("... ") { continue; }
+                let m = fs::metadata(line).ok();
+                rows.push(row(line.to_string(), m.as_ref()));
+            }
+        }
+        if !indexed {
+            // no rust-search installed: look through the current folder and below instead
+            let root = if cur_virtual() { PathBuf::from(env::var_os("USERPROFILE").unwrap_or_else(|| "C:\\".into())) } else { cur_dir() };
+            rows = local_search(&root, q).0;
         }
     }
-    if !indexed {
-        // no rust-search installed: look through the current folder and below instead
-        let root = if cur_virtual() { PathBuf::from(env::var_os("USERPROFILE").unwrap_or_else(|| "C:\\".into())) } else { cur_dir() };
-        rows = local_search(&root, q).0;
+    // results are a plain list even when the search started on Home / This PC (their tile bands would draw over it)
+    let (list, was_tiles) = ST.with_borrow(|st| (st.list, st.tiles));
+    if was_tiles {
+        ST.with_borrow_mut(|st| { st.tiles = false; st.view = ViewMode::Details; st.thumbs = false; st.tile_starts.clear(); st.tile_bands.clear(); st.tile_collapsed.clear(); });
+        THUMBS.store(false, Relaxed);
+        apply_view(list, ViewMode::Details);
+        set_column_titles(list, [
+            t!("Имя", "Name", ja: "名前", pt: "Nome", zh: "名称"),
+            t!("Дата изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期"),
+            t!("Тип", "Type", ja: "種類", pt: "Tipo", zh: "类型"),
+            t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"),
+        ]);
     }
     ui::set_search(Some(q.to_string()));
     if let Some(se) = ST.with_borrow(|st| (st.search != 0 as HWND).then_some(st.search)) { unsafe { SetWindowTextW(se, w(q).as_ptr()) }; }
@@ -1575,6 +1601,28 @@ fn reset_thumbs() {
 }
 
 fn reload(h: HWND) { load(h, cur_dir()); }
+
+/// After a file operation / a drop: a folder refreshes in place, and a search re-runs instead of being left behind
+/// (`load` would clear the search results and show the folder under them again).
+pub(crate) fn refresh_after_ops(h: HWND) {
+    if desk() { reload(h); return; }
+    if let Some(q) = ui::search_text() { search(h, &q); return; }
+    reload_keep(h);
+}
+
+/// Up / Alt+Up: the parent folder, and from a drive root (or a virtual page other than Home) the Home page.
+fn go_up(h: HWND) {
+    let dir = cur_dir();
+    let s = dir.to_string_lossy();
+    if s.starts_with("::") {
+        if s != "::home" { load(h, PathBuf::from("::home")); }
+        return;
+    }
+    match dir.parent() {
+        Some(p) if p != dir && !p.as_os_str().is_empty() => load(h, p.to_path_buf()),
+        _ => load(h, PathBuf::from("::home")), // C:\ and other roots: Up is the Home page, as in Win11
+    }
+}
 
 /// Watches `dir` and posts WM_REFRESH when its listing changes; the previous watcher stops on the generation bump.
 fn start_watch(h: HWND, dir: PathBuf) {
@@ -3039,20 +3087,20 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     3 => tab_new(),
                     4 => nav(h, true),
                     5 => nav(h, false),
-                    6 => { if let Some(p) = cur_dir().parent() { load(h, p.to_path_buf()) } }
-                    7 => reload(h),
+                    6 => go_up(h),
+                    7 => refresh_after_ops(h),
                     8 => toggle_view(h),
                     9 => search_focus(),
                     10..=15 => {
                         let (list, dir, paths) = selected();
                         match wp {
-                            10 | 11 if !paths.is_empty() && !cur_virtual() => match real_paths(&paths) { Ok(p) => { let _ = sh::clip_set(h, &p, wp == 10 && !in_zip()); } Err(e) => warn(h, &e) },
-                            12 => { paste(h, &dir); reload(h); }
-                            13 if !in_zip() && !cur_virtual() => {
+                            10 | 11 if !paths.is_empty() && (!cur_virtual() || ui::searching()) => match real_paths(&paths) { Ok(p) => { let _ = sh::clip_set(h, &p, wp == 10 && !in_zip()); } Err(e) => warn(h, &e) },
+                            12 => { paste(h, &dir); refresh_after_ops(h); }
+                            13 if !in_zip() && (!cur_virtual() || ui::searching()) => {
                                 let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
                                 if i >= 0 { SetFocus(list); put(list, LVM_EDITLABELW, i as usize, 0); }
                             }
-                            14 if !paths.is_empty() && !in_zip() && !cur_virtual() => { let _ = fileops::delete(h, paths, false); }
+                            14 if !paths.is_empty() && !in_zip() && (!cur_virtual() || ui::searching()) => { let _ = fileops::delete(h, paths, false); }
                             15 if !cur_virtual() => create_new(h, &dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true),
                             _ => {}
                         }
@@ -3116,8 +3164,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         InvalidateRect(h, ptr::null(), 0);
                     }
                     93 => toggle_checkboxes(),
-                    94 => { SHOW_EXT.fetch_xor(true, Relaxed); save_globals(); reload(h); }
-                    95 => { SHOW_HIDDEN.fetch_xor(true, Relaxed); save_globals(); reload(h); }
+                    94 => { SHOW_EXT.fetch_xor(true, Relaxed); save_globals(); refresh_after_ops(h); }
+                    95 => { SHOW_HIDDEN.fetch_xor(true, Relaxed); save_globals(); refresh_after_ops(h); }
                     96 => {
                         COMPACT.fetch_xor(true, Relaxed);
                         save_globals();
@@ -3302,7 +3350,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             // dropped on the desktop itself: the icons were moved (or went into a folder icon), no reload needed
                             let handled = desk() && desk::drag_end(h, list);
                             drag_log(&format!("moved on the desktop: {handled}"));
-                            if !handled { reload(h); }
+                            if !handled { refresh_after_ops(h); }
                         }
                     }
                     LVN_KEYDOWN => {
@@ -3315,11 +3363,11 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             0x08 => if let Some(p) = dir.parent() { load(h, p.to_path_buf()) },
                             0x1B if fileops::busy() => { fileops::cancel_all(); return 0; } // Esc stops copying / moving / deleting
                             0x1B if jobs::busy() => { jobs::cancel(); return 0; } // Esc stops packing / unpacking
-                            0x2E if !paths.is_empty() && !in_zip() && !cur_virtual() => { let _ = fileops::delete(h, paths, shift); }
+                            0x2E if !paths.is_empty() && !in_zip() && (!cur_virtual() || ui::searching()) => { let _ = fileops::delete(h, paths, shift); return 0; }
                             0x5A if ctrl => { fileops::undo(h); return 0; }
                             // Space: a quick look. Pictures open in photoview, videos / text / anything else in its default app
                             0x20 if !desk() => if let Some(p) = paths.first().filter(|p| p.is_file()) { activate(h, p.clone(), false); },
-                            0x71 if !in_zip() && !cur_virtual() => {
+                            0x71 if !in_zip() && (!cur_virtual() || ui::searching()) => {
                                 let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
                                 if i >= 0 { put(list, LVM_EDITLABELW, i as usize, 0); }
                             }
@@ -3360,7 +3408,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             }
                             _ => return 0,
                         }
-                        reload(h);
+                        refresh_after_ops(h);
                     }
                     LVN_BEGINLABELEDITW => {
                         if cur_virtual() { return 1; }
@@ -3396,7 +3444,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             WM_SETFOCUS => { SetFocus(ST.with_borrow(|st| st.list)); 0 }
-            WM_APP => { reload(h); 0 }
+            WM_APP => { refresh_after_ops(h); 0 }
             WM_REFRESH if !desk() => { SetTimer(h, 9, 300, None); 0 } // debounce bursts of changes
             WM_TIMER if !desk() && wp == 11 => {
                 let d = DRAG_DIR.load(Relaxed);
@@ -3426,7 +3474,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             fileops::WM_FILEOPS_CONFLICT => { fileops::conflict(h, lp as *mut fileops::Conflict); 0 }
             WM_JOB => {
                 let err = *Box::from_raw(wp as *mut Option<String>);
-                reload(h);
+                refresh_after_ops(h);
                 ui::status_dirty(h);
                 if let Some(e) = err { MessageBoxW(h, w(&e).as_ptr(), w("WinRust Explorer").as_ptr(), MB_ICONWARNING); }
                 0
@@ -3436,7 +3484,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     1 => nav(h, true),
                     2 => nav(h, false),
                     3 => { let (_, dir, sel) = selected(); properties(&sel.first().cloned().unwrap_or(dir)); }
-                    4 => if let Some(p) = cur_dir().parent() { load(h, p.to_path_buf()) },
+                    4 => go_up(h),
                     5 => { // Alt+D: the address bar, all selected
                         let edit = ST.with_borrow(|st| st.edit);
                         SetFocus(edit);

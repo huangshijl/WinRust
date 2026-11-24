@@ -208,7 +208,7 @@ pub fn finished(h: HWND, report: Report) {
         RUNNING.store(false, Relaxed);
         *ONLY.lock().unwrap() = 0;
     }
-    super::reload(h);
+    super::refresh_after_ops(h);
     if !errors.is_empty() {
         let more = if errors.len() > 5 { format!("\n… +{}", errors.len() - 5) } else { String::new() };
         let text = tf!("Не удалось выполнить операции: {}\n{}{}", "{} item(s) failed:\n{}{}", ja: "{} 件失敗しました:\n{}{}", pt: "{} item(ns) falharam:\n{}{}", zh: "{} 项操作失败：\n{}{}", errors.len(), errors[..errors.len().min(5)].join("\n"), more);
@@ -232,7 +232,7 @@ pub fn undo(h: HWND) {
     if !u.recycled.is_empty() {
         let mut n = 0;
         for p in &u.recycled { if super::recycle_restore_original(h, p) { n += 1; } }
-        super::reload(h);
+        super::refresh_after_ops(h);
         if n == 0 {
             super::warn(h, t!("В корзине больше нет этих элементов", "The deleted items are no longer in the Recycle Bin", ja: "削除された項目がごみ箱にありません", pt: "Os itens excluídos não estão mais na Lixeira", zh: "回收站中已找不到被删除的项目"));
         }
