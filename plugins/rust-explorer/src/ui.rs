@@ -76,6 +76,7 @@ const MORE: i32 = 33;
 const SEARCH_BOX: i32 = 34;
 const SEARCH_CLEAR: i32 = 35;
 const NAV_BTN: i32 = 36; // shows / hides the navigation pane, left of "New"
+const SETTINGS: i32 = 37; // the gear at the far right: preferences
 const WMIN: i32 = 41; // window buttons, in the tab row (which is the title bar: the window has no caption)
 const WMAX: i32 = 42;
 const WCLOSE: i32 = 43;
@@ -285,12 +286,29 @@ fn items_text(k: usize) -> String {
 pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
     let cd = &*(lp as *const NMLVCUSTOMDRAW);
     let list = cd.nmcd.hdr.hwndFrom;
-    if ST.with(|c| c.try_borrow().map_or(true, |s| s.thumbs)) { return CDRF_DODEFAULT as isize; }
+    let (thumbs, tiles) = ST.with(|c| c.try_borrow().map_or((true, false), |s| (s.thumbs, s.tiles && s.view == ViewMode::Tiles)));
+    if thumbs && !tiles { return CDRF_DODEFAULT as isize; }
     let dc = cd.nmcd.hdc;
     let mut cr: RECT = std::mem::zeroed();
     GetClientRect(list, &mut cr);
     match cd.nmcd.dwDrawStage {
         CDDS_PREPAINT => (CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT) as isize,
+        CDDS_POSTPAINT if tiles => {
+            // the section headings of a tile page ("Folders (7)", "Devices and drives (8)")
+            let bands = ST.with_borrow(|s| s.tile_bands.clone());
+            let (f_head, f_ch) = (font(13, 600, ui_face()) as HFONT, font(11, 400, winrust_common::style::icon_face()) as HFONT);
+            SetBkMode(dc, TRANSPARENT as i32);
+            for (title, y) in bands {
+                SelectObject(dc, f_ch);
+                text(dc, "\u{E70D}", rc(sc(14), y + sc(8), sc(30), y + sc(30)), pal().dim, DT_CENTER);
+                SelectObject(dc, f_head);
+                text(dc, &title, rc(sc(34), y + sc(8), cr.right - sc(14), y + sc(30)), pal().text, DT_LEFT);
+                fill(dc, rc(sc(14), y + sc(32), cr.right - sc(14), y + sc(33)), pal().line, 0);
+            }
+            DeleteObject(f_head as HGDIOBJ);
+            DeleteObject(f_ch as HGDIOBJ);
+            CDRF_DODEFAULT as isize
+        },
         CDDS_POSTPAINT => {
             // the Explorer theme paints column separators into the empty area below the rows; cover it with the list colour
             let n = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0);
@@ -333,6 +351,58 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             }
             CDRF_DODEFAULT as isize
         }
+        CDDS_ITEMPREPAINT if tiles => {
+            // a wide tile: the icon on the left, the name on the right and, for a drive, how full it is
+            let i = cd.nmcd.dwItemSpec;
+            let row = ST.with(|c| {
+                let mut st = c.try_borrow_mut().ok()?;
+                let State { dir, rows, .. } = &mut *st;
+                let r = rows.get_mut(i as usize)?;
+                let actual = r.target.clone().unwrap_or_else(|| dir.join(&r.name));
+                if r.icon < 0 { r.icon = icon_of(&actual, r.dir); }
+                Some((r.name.clone(), r.dir, r.target.clone(), actual))
+            });
+            let Some((name, is_dir, target, actual)) = row else { return CDRF_SKIPDEFAULT as isize };
+            let mut p: POINT = std::mem::zeroed();
+            if SendMessageW(list, LVM_GETITEMPOSITION, i as usize, &mut p as *mut _ as isize) == 0 { return CDRF_SKIPDEFAULT as isize; }
+            // a paint can arrive before the tile layout has placed the item: skip nonsense coordinates
+            if p.x.abs() > sc(8000) || p.y.abs() > sc(8000) { return CDRF_SKIPDEFAULT as isize; }
+            let (cw, chh) = (sc(330), sc(84));
+            let cell = rc(p.x, p.y, p.x + cw, p.y + chh);
+            let sel = SendMessageW(list, LVM_GETITEMSTATE, i as usize, LVIS_SELECTED as isize) as u32 & LVIS_SELECTED != 0;
+            let hot = ROWHOT.get() == i as isize;
+            if sel { fill(dc, cell, pal().sel, sc(8)); } else if hot { fill(dc, cell, pal().row_hover, sc(8)); }
+            let ipx = sc(48);
+            let hicon = tile_icon(&actual, is_dir);
+            if hicon != 0 {
+                DrawIconEx(dc, p.x + sc(12), p.y + (chh - ipx) / 2, hicon as _, ipx, ipx, 0, ptr::null_mut(), DI_NORMAL);
+                DestroyIcon(hicon as _);
+            }
+            if FONTS.get().0 == 0 { FONTS.set((font(13, 400, ui_face()), font(12, 400, ui_face()))); }
+            let (f_name, f_det) = FONTS.get();
+            SetBkMode(dc, TRANSPARENT as i32);
+            SelectObject(dc, f_name as HFONT);
+            let (tx, tr) = (p.x + sc(72), p.x + cw - sc(12));
+            let drive = target.as_ref().filter(|p| { let s = p.to_string_lossy(); s.len() == 3 && s.ends_with(":\\") });
+            if drive.is_some() {
+                text(dc, &name, rc(tx, p.y + sc(10), tr, p.y + sc(28)), pal().text, DT_LEFT);
+            } else {
+                text(dc, &name, rc(tx, p.y + (chh - sc(18)) / 2, tr, p.y + (chh + sc(18)) / 2), pal().text, DT_LEFT);
+            }
+            if let Some((free, total)) = drive.and_then(|p| drive_space(p)) {
+                let bar = rc(tx, p.y + sc(31), tr, p.y + sc(39));
+                fill(dc, bar, mix(listbg(), pal().text, 0.18), sc(3));
+                let used = 1.0 - free as f32 / total as f32;
+                let low = (free as f64 / total as f64) < 0.10; // under a tenth free: red
+                let fw = ((bar.right - bar.left) as f32 * used) as i32;
+                fill(dc, rc(bar.left, bar.top, bar.left + fw.max(sc(3)), bar.bottom), if low { winrust_common::style::BAD } else { pal().accent }, sc(3));
+                SelectObject(dc, f_det as HFONT);
+                let gb = |b: u64| b as f64 / 1_073_741_824.0;
+                let line = tf!("{:.1} ГБ свободно из {:.0} ГБ", "{:.1} GB free of {:.0} GB", ja: "{:.1} GB 空き / {:.0} GB", pt: "{:.1} GB livres de {:.0} GB", zh: "{:.1} GB 可用，共 {:.0} GB", gb(free), gb(total));
+                text(dc, &line, rc(tx, p.y + sc(43), tr, p.y + sc(59)), pal().dim, DT_LEFT);
+            }
+            CDRF_SKIPDEFAULT as isize
+        }
         CDDS_ITEMPREPAINT => {
             let i = cd.nmcd.dwItemSpec;
             let row = ST.with(|c| {
@@ -341,9 +411,9 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
                 let r = rows.get_mut(i)?;
                 let actual = r.origin.clone().or_else(|| r.target.clone()).unwrap_or_else(|| dir.join(&r.name));
                 if r.icon < 0 && !r.hdr { r.icon = icon_of(&actual, r.dir); }
-                Some((r.name.clone(), r.target.is_some(), r.kind.clone(), r.dir, r.time, r.size, r.icon, r.hdr))
+                Some((r.name.clone(), r.target.is_some(), r.kind.clone(), r.dir, r.time, r.size, r.icon, r.hdr, r.target.clone()))
             });
-            let Some((name, virtual_row, row_kind, is_dir, time, size, icon, hdr)) = row else { return CDRF_DODEFAULT as isize };
+            let Some((name, virtual_row, row_kind, is_dir, time, size, icon, hdr, target)) = row else { return CDRF_DODEFAULT as isize };
             let mut r = RECT { left: LVIR_BOUNDS as i32, ..std::mem::zeroed() };
             SendMessageW(list, LVM_GETITEMRECT, i, &mut r as *mut _ as isize);
             let row_r = rc(0, r.top, cr.right, r.bottom);
@@ -423,7 +493,22 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             text(dc, &date_text(time), rc(x[1] + sc(10), r.top, x[2] - sc(8), r.bottom), dim, DT_LEFT);
             let kind = row_kind.unwrap_or_else(|| type_text(&name, is_dir));
             text(dc, &kind, rc(x[2] + sc(10), r.top, x[3] - sc(8), r.bottom), dim, DT_LEFT | DT_PATH_ELLIPSIS);
-            if !is_dir || size > 0 { text(dc, &size_text(size), rc(x[3], r.top, x[3] + cw[3] - sc(14), r.bottom), dim, DT_RIGHT); }
+            let drive = target.as_ref().filter(|p| { let s = p.to_string_lossy(); s.len() == 3 && s.ends_with(":\\") });
+            let mut drew = false;
+            if let Some((free, total)) = drive.and_then(|p| drive_space(p)) {
+                if total > 0 {
+                    let used = 1.0 - free as f32 / total as f32;
+                    let unit = size_text(total).rsplit(' ').next().unwrap_or("GB").to_string();
+                    let per = if total >= (1 << 30) { 1u64 << 30 } else { 1u64 << 20 };
+                    text(dc, &format!("{:.1}/{:.1}{unit}", free as f64 / per as f64, total as f64 / per as f64), rc(x[3], r.top + sc(2), x[3] + cw[3] - sc(14), r.top + sc(15)), dim, DT_RIGHT);
+                    let bar = rc(x[3] + sc(2), r.bottom - sc(11), x[3] + cw[3] - sc(14), r.bottom - sc(5));
+                    fill(dc, bar, mix(listbg(), pal().text, 0.14), sc(2));
+                    let fw = ((bar.right - bar.left) as f32 * used) as i32;
+                    fill(dc, rc(bar.left, bar.top, bar.left + fw.max(sc(2)), bar.bottom), if used > 0.9 { winrust_common::style::BAD } else { pal().accent }, sc(1));
+                    drew = true;
+                }
+            }
+            if !drew && (!is_dir || size > 0) { text(dc, &size_text(size), rc(x[3], r.top, x[3] + cw[3] - sc(14), r.bottom), dim, DT_RIGHT); }
             SelectObject(dc, of);
             CDRF_SKIPDEFAULT as isize
         }
@@ -523,7 +608,7 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
 
 // ---------- layout and hit testing ----------
 
-struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, back: RECT, fwd: RECT, up: RECT, reload: RECT, pill: RECT, search: RECT, search_clear: RECT, navbtn: RECT, new: RECT, new_more: RECT, cut: RECT, copy: RECT, paste: RECT, paste_more: RECT, rename: RECT, delete: RECT, share: RECT, sort: RECT, view: RECT, more: RECT, wmin: RECT, wmax: RECT, wclose: RECT, labels: bool, seps: Vec<i32> }
+struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, back: RECT, fwd: RECT, up: RECT, reload: RECT, pill: RECT, search: RECT, search_clear: RECT, navbtn: RECT, new: RECT, new_more: RECT, cut: RECT, copy: RECT, paste: RECT, paste_more: RECT, rename: RECT, delete: RECT, share: RECT, sort: RECT, view: RECT, more: RECT, gear: RECT, wmin: RECT, wmax: RECT, wclose: RECT, labels: bool, seps: Vec<i32> }
 
 fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT { RECT { left: l, top: t, right: r, bottom: b } }
 
@@ -606,14 +691,15 @@ fn layout(cw: i32, n: usize) -> Layout {
     let delete = btn(x, item(l_delete)); x += delete.right - delete.left + sc(2);
     let share = if cw >= sc(620) { let r = btn(x, item(l_share)); x = r.right + sc(2); r } else { rc(0, 0, 0, 0) };
     seps.push(x + sc(2)); x += sc(9);
-    let more = rc(cw - pad - sc(40), cy0, cw - pad, cy1);
+    let gear = rc(cw - pad - sc(34), cy0, cw - pad, cy1);
+    let more = rc(gear.left - sc(44), cy0, gear.left - sc(4), cy1);
     let view_w = if labels { sc(10) + sc(16) + sc(7) + label_w(l_view) + sc(8) + sc(12) } else { sc(54) };
     let view = rc(more.left - sc(4) - view_w, cy0, more.left - sc(4), cy1);
     let sort_w = if labels { sc(10) + sc(16) + sc(7) + label_w(l_sort) + sc(8) + sc(12) } else { sc(54) };
     let sort = rc(view.left - sc(2) - sort_w, cy0, view.left - sc(2), cy1);
     let _ = x;
 
-    Layout { tabs, close, plus, back: nav(0), fwd: nav(1), up: nav(2), reload, pill, search, search_clear, navbtn, new, new_more, cut, copy, paste, paste_more, rename, delete, share, sort, view, more, wmin, wmax, wclose, labels, seps }
+    Layout { tabs, close, plus, back: nav(0), fwd: nav(1), up: nav(2), reload, pill, search, search_clear, navbtn, new, new_more, cut, copy, paste, paste_more, rename, delete, share, sort, view, more, gear, wmin, wmax, wclose, labels, seps }
 }
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool { x >= r.left && x < r.right && y >= r.top && y < r.bottom }
@@ -624,7 +710,7 @@ fn hit(l: &Layout, x: i32, y: i32) -> i32 {
     }
     for (i, c) in l.close.iter().enumerate() { if inside(c, x, y) { return CLOSE + i as i32; } }
     for (i, t) in l.tabs.iter().enumerate() { if inside(t, x, y) { return TAB + i as i32; } }
-    for (k, r) in [(BACK, &l.back), (FWD, &l.fwd), (UP, &l.up), (RELOAD, &l.reload), (PLUS, &l.plus), (NAV_BTN, &l.navbtn)] {
+    for (k, r) in [(BACK, &l.back), (FWD, &l.fwd), (UP, &l.up), (RELOAD, &l.reload), (PLUS, &l.plus), (NAV_BTN, &l.navbtn), (SETTINGS, &l.gear)] {
         if inside(r, x, y) { return k; }
     }
     if inside(&l.new_more, x, y) { return NEW_MORE; }
@@ -906,6 +992,9 @@ unsafe fn paint_chrome(hwnd: HWND) {
     glow(dc, MORE, l.more, pal().bg, pal().hover, sc(4), hot == MORE);
     SelectObject(dc, f_glyph);
     text(dc, "\u{E712}", l.more, pal().text, DT_CENTER);
+    glow(dc, SETTINGS, l.gear, pal().bg, pal().hover, sc(4), hot == SETTINGS);
+    SelectObject(dc, f_glyph);
+    text(dc, "\u{E713}", l.gear, pal().dim, DT_CENTER);
 
     fill(dc, rc(0, cr.bottom - 1, cr.right, cr.bottom), pal().line, 0); // hairline under the chrome
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
@@ -1068,6 +1157,21 @@ unsafe fn more_menu(h: HWND, at: RECT) {
     if id != 0 { PostMessageW(GetParent(h), WM_UI, id as usize, 0); }
 }
 
+/// The gear's menu: preferences that are not view options. Grows as more of them appear.
+unsafe fn settings_menu(h: HWND, at: RECT) {
+    let items = vec![ctxmenu::Item {
+        id: 1,
+        text: t!("Показывать занятость дисков в области переходов", "Show drive usage in the navigation pane", ja: "ナビゲーション ウィンドウにドライブの使用量を表示", pt: "Mostrar uso das unidades no painel de navegação", zh: "在导航窗格显示磁盘容量").into(),
+        checked: crate::SHOW_CAP.load(Relaxed),
+        ..Default::default()
+    }];
+    if dropdown(h, at, items) == 1 {
+        crate::SHOW_CAP.fetch_xor(true, Relaxed);
+        crate::save_globals();
+        nav_dirty(); // the rows change height; nav_dirty clamps the scroll
+    }
+}
+
 unsafe fn tab_menu(h: HWND, i: usize, at: RECT) {
     let items = vec![
         mi(1, t!("Дублировать вкладку", "Duplicate tab", ja: "タブを複製", pt: "Duplicar guia", zh: "复制标签页")),
@@ -1197,7 +1301,7 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 return 0;
             }
             match k {
-                NEW | NEW_MORE | PASTE_MORE | SORT | VIEW | MORE => { PENDING_MENU.set(k); PRESS.set((k, now())); InvalidateRect(h, ptr::null(), 0); return 0; }
+                NEW | NEW_MORE | PASTE_MORE | SORT | VIEW | MORE | SETTINGS => { PENDING_MENU.set(k); PRESS.set((k, now())); InvalidateRect(h, ptr::null(), 0); return 0; }
                 SEARCH_BOX => {
                     let search = ST.with(|c| c.try_borrow().map_or(ptr::null_mut(), |s| s.search));
                     SetFocus(search);
@@ -1252,6 +1356,7 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                         SORT => sort_menu(h, l.sort),
                         VIEW => view_menu(h, l.view),
                         MORE => more_menu(h, l.more),
+                        SETTINGS => settings_menu(h, l.gear),
                         _ => {}
                     }
                 }
@@ -1317,7 +1422,8 @@ enum NavKind { Section, Home, Folder, Drive, Recycle, ThisPC }
 struct NavItem { title: String, path: PathBuf, glyph: &'static str, cap: Option<(u64, u64)>, depth: i32, kind: NavKind, expandable: bool, expanded: bool }
 
 fn nav_h(it: &NavItem) -> i32 {
-    sc(if matches!(it.kind, NavKind::Section | NavKind::ThisPC) { NAV_HEAD } else if it.cap.is_some() { NAV_DRIVE } else { NAV_ROW })
+    let cap = it.cap.is_some() && crate::SHOW_CAP.load(Relaxed);
+    sc(if matches!(it.kind, NavKind::Section | NavKind::ThisPC) { NAV_HEAD } else if cap { NAV_DRIVE } else { NAV_ROW })
 }
 
 thread_local! {
@@ -1436,6 +1542,26 @@ pub fn drive_list() -> Vec<DriveInfo> {
         }
     }
     out
+}
+
+/// The shell's large icon for a tile (32 px from the shell, drawn stretched to 48).
+unsafe fn tile_icon(p: &Path, dir: bool) -> isize {
+    let mut fi: SHFILEINFOW = std::mem::zeroed();
+    let s = p.to_string_lossy();
+    let drive = s.len() == 3 && s.ends_with(":\\");
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let own = drive || (!dir && matches!(ext.as_str(), "exe" | "lnk" | "ico" | "url" | "scr"));
+    let attr = if dir { 0x10 } else { 0x80 };
+    SHGetFileInfoW(w(&s).as_ptr(), attr, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | if own { 0 } else { SHGFI_USEFILEATTRIBUTES });
+    fi.hIcon as isize
+}
+
+/// Free and total bytes of a drive root, None for anything else.
+pub fn drive_space(root: &Path) -> Option<(u64, u64)> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let (mut free, mut total) = (0u64, 0u64);
+    let ok = unsafe { GetDiskFreeSpaceExW(w(&root.to_string_lossy()).as_ptr(), &mut free, &mut total, ptr::null_mut()) };
+    (ok != 0 && total > 0).then_some((free, total))
 }
 
 /// Quick access folders: the known user folders that exist, then the pinned ones.
@@ -1580,6 +1706,8 @@ pub unsafe fn layout_children(cw: i32, ch: i32) {
     ShowWindow(nav, if on { SW_SHOWNA } else { SW_HIDE });
     MoveWindow(list, nw, top, cw - nw, h, 1);
     fit_filler(list);
+    // a tile page lays its cells out for the current width (the first layout happens before the list has its size)
+    if ST.with_borrow(|st| st.tiles) { crate::tile_layout(list); InvalidateRect(list, ptr::null(), 0); }
     nav_ensure_current();
 }
 
@@ -1661,11 +1789,11 @@ unsafe fn paint_nav(hwnd: HWND) {
             SelectObject(dc, f_txt);
             let text_x = indent + sc(40);
             text(dc, &it.title, rc(text_x, line.top, cr.right - sc(8), line.bottom), mix(pal().dim, pal().text, ta.max(th)), DT_LEFT);
-            if let Some((free, total)) = it.cap {
+            if let Some((free, total)) = it.cap.filter(|_| crate::SHOW_CAP.load(Relaxed)) {
                 // usage bar like Windows' "This PC": accent, red once the drive is more than 90 % full
                 let used = 1.0 - free as f32 / total as f32;
-                let bar = rc(text_x, y + sc(28), cr.right - sc(14), y + sc(32));
-                fill(dc, bar, mix(pal().bg, pal().text, 0.12), sc(4));
+                let bar = rc(text_x, y + sc(27), cr.right - sc(14), y + sc(34));
+                fill(dc, bar, mix(pal().bg, pal().text, 0.12), sc(3));
                 let fw = ((bar.right - bar.left) as f32 * used) as i32;
                 fill(dc, rc(bar.left, bar.top, bar.left + fw.max(sc(4)), bar.bottom), if used > 0.9 { winrust_common::style::BAD } else { pal().accent }, sc(4));
                 SelectObject(dc, f_small);

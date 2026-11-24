@@ -123,21 +123,22 @@ pub(crate) fn save_current_view() {
     write_views(&lines);
 }
 
-fn read_globals() -> Option<(bool, bool, bool)> {
+fn read_globals() -> Option<(bool, bool, bool, bool)> {
     for l in read_views() {
         let mut it = l.split('\t');
         if it.next()? != "*" { continue; }
         let compact = it.next()? == "1";
         let ext = it.next()? == "1";
-        let nav = it.next().map_or(true, |v| v == "1"); // older files have no third column
-        return Some((compact, ext, nav));
+        let nav = it.next().map_or(true, |v| v == "1"); // older files have fewer columns
+        let cap = it.next().map_or(true, |v| v == "1");
+        return Some((compact, ext, nav, cap));
     }
     None
 }
 
-fn save_globals() {
+pub(crate) fn save_globals() {
     let mut lines: Vec<String> = read_views().into_iter().filter(|l| !l.starts_with("*\t")).collect();
-    lines.push(format!("*\t{}\t{}\t{}", u8::from(COMPACT.load(Relaxed)), u8::from(SHOW_EXT.load(Relaxed)), u8::from(NAV_ON.load(Relaxed))));
+    lines.push(format!("*\t{}\t{}\t{}\t{}", u8::from(COMPACT.load(Relaxed)), u8::from(SHOW_EXT.load(Relaxed)), u8::from(NAV_ON.load(Relaxed)), u8::from(SHOW_CAP.load(Relaxed))));
     write_views(&lines);
 }
 /// What the bar reserves at the top and bottom of the screen: the work area topbar sets when there is no explorer.
@@ -195,9 +196,9 @@ impl Hist {
     fn forward(&mut self) -> Option<PathBuf> { if self.pos + 1 < self.v.len() { self.pos += 1; Some(self.v[self.pos].clone()) } else { None } }
 }
 
-struct State { list: HWND, tab: HWND, edit: HWND, search: HWND, dir: PathBuf, rows: Vec<Row>, all: Vec<Row>, thumbs: bool, view: ViewMode, himl: isize, iml_px: i32, tabs: Vec<PathBuf>, active: usize, hist: Hist, closed: Vec<PathBuf> }
+struct State { list: HWND, tab: HWND, edit: HWND, search: HWND, dir: PathBuf, rows: Vec<Row>, all: Vec<Row>, thumbs: bool, tiles: bool, tile_starts: Vec<(String, usize)>, tile_bands: Vec<(String, i32)>, view: ViewMode, himl: isize, iml_px: i32, tabs: Vec<PathBuf>, active: usize, hist: Hist, closed: Vec<PathBuf> }
 thread_local! {
-    static ST: RefCell<State> = RefCell::new(State { list: 0 as _, tab: 0 as _, edit: 0 as _, search: 0 as _, dir: PathBuf::new(), rows: vec![], all: vec![], thumbs: false, view: ViewMode::Details, himl: 0, iml_px: 96, tabs: vec![], active: 0, hist: Hist { v: vec![], pos: 0 }, closed: vec![] });
+    static ST: RefCell<State> = RefCell::new(State { list: 0 as _, tab: 0 as _, edit: 0 as _, search: 0 as _, dir: PathBuf::new(), rows: vec![], all: vec![], thumbs: false, tiles: false, tile_starts: vec![], tile_bands: vec![], view: ViewMode::Details, himl: 0, iml_px: 96, tabs: vec![], active: 0, hist: Hist { v: vec![], pos: 0 }, closed: vec![] });
     static COLLAPSED: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new()); // group headings the user collapsed
 }
 static SORT_COL: AtomicUsize = AtomicUsize::new(0); // 0 name, 1 size, 2 modified
@@ -206,6 +207,7 @@ static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false); // Ctrl+H
 static SHOW_EXT: AtomicBool = AtomicBool::new(true); // View > File name extensions
 static COMPACT: AtomicBool = AtomicBool::new(false); // View > Compact view
 pub static NAV_ON: AtomicBool = AtomicBool::new(true); // View > Show > Navigation pane
+pub static SHOW_CAP: AtomicBool = AtomicBool::new(true); // settings: drive usage under the drive names in the pane
 pub static CHECK_BOXES: AtomicBool = AtomicBool::new(false); // View > Show > Item check boxes (drawn by us)
 thread_local! { static CHECKED: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new()); } // names with their box ticked
 pub fn checked(name: &str) -> bool { CHECKED.with_borrow(|s| s.contains(name)) }
@@ -980,7 +982,9 @@ pub fn cur_dir() -> PathBuf { ST.with_borrow(|st| st.dir.clone()) }
 /// System image-list index. Extension-based (no disk access) except for files that carry their own icon.
 fn icon_of(p: &PathBuf, dir: bool) -> i32 {
     let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let own = !dir && matches!(ext.as_str(), "exe" | "lnk" | "ico" | "url" | "scr");
+    let s = p.to_string_lossy();
+    let drive = s.len() == 3 && s.ends_with(":\\"); // a drive root gets its own icon from the shell
+    let own = drive || (!dir && matches!(ext.as_str(), "exe" | "lnk" | "ico" | "url" | "scr"));
     let mut fi: SHFILEINFOW = unsafe { std::mem::zeroed() };
     let attr = if dir { 0x10 } else { 0x80 }; // DIRECTORY / NORMAL
     let flags = SHGFI_SYSICONINDEX | SHGFI_SMALLICON | if own { 0 } else { SHGFI_USEFILEATTRIBUTES };
@@ -1086,24 +1090,16 @@ fn recycle_rows() -> Vec<Row> {
 fn virtual_rows(dir: &Path) -> Option<Vec<Row>> {
     let head = |label: &str| Row { name: format!("?{label}"), origin: None, target: None, kind: None, dir: false, size: 0, time: 0, icon: -1, thumb: -1, hdr: true };
     match dir.to_string_lossy().as_ref() {
-        "::thispc" => {
-            let mut drives: Vec<Row> = ui::drive_list().into_iter().map(|d| {
-                let kind = if d.network { t!("Сетевой диск", "Network Drive", ja: "ネットワーク ドライブ", pt: "Unidade de rede", zh: "网络驱动器") } else { t!("Локальный диск", "Local Disk", ja: "ローカル ディスク", pt: "Disco local", zh: "本地磁盘") };
-                Row { name: d.title, origin: None, target: Some(d.root), kind: Some(kind.into()), dir: true, size: d.cap.map_or(0, |(_, total)| total), time: 0, icon: -1, thumb: -2, hdr: false }
-            }).collect();
-            drives.sort_by_key(|r| r.name.to_lowercase());
-            let mut rows = vec![head(t!("Устройства и диски", "Devices and drives", ja: "デバイスとドライブ", pt: "Dispositivos e unidades", zh: "设备和驱动器"))];
-            rows.extend(drives);
-            Some(rows)
-        }
+        "::thispc" => Some(drive_rows()),
         "::home" => {
             let mut folders: Vec<Row> = ui::quick_folders().into_iter().map(|(title, p, _)| {
                 let m = fs::metadata(&p).ok();
                 Row { name: title, origin: None, target: Some(p), kind: None, dir: true, size: 0, time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2, hdr: false }
             }).collect();
             folders.sort_by_key(|r| r.name.to_lowercase());
-            let mut rows = vec![head(t!("Быстрый доступ", "Quick access", ja: "クイック アクセス", pt: "Acesso rápido", zh: "快速访问"))];
-            rows.extend(folders);
+            // folders first, then the drives: the page is drawn as tiles under section headings
+            let mut rows = folders;
+            rows.extend(drive_rows());
             Some(rows)
         }
         "::recycle" => {
@@ -1115,6 +1111,16 @@ fn virtual_rows(dir: &Path) -> Option<Vec<Row>> {
         }
         _ => None,
     }
+}
+
+/// Drives as rows: name, the kind column and the total size (the free space is read per row when the row is drawn).
+fn drive_rows() -> Vec<Row> {
+    let mut drives: Vec<Row> = ui::drive_list().into_iter().map(|d| {
+        let kind = if d.network { t!("Сетевой диск", "Network Drive", ja: "ネットワーク ドライブ", pt: "Unidade de rede", zh: "网络驱动器") } else { t!("Локальный диск", "Local Disk", ja: "ローカル ディスク", pt: "Disco local", zh: "本地磁盘") };
+        Row { name: d.title, origin: None, target: Some(d.root), kind: Some(kind.into()), dir: true, size: d.cap.map_or(0, |(_, total)| total), time: 0, icon: -1, thumb: -2, hdr: false }
+    }).collect();
+    drives.sort_by_key(|r| r.target.as_ref().map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default());
+    drives
 }
 
 /// The `$I` record next to a `$R` item.
@@ -1247,6 +1253,11 @@ fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
 
 /// Loads `dir` into the virtual list and the active tab. Unreadable dir (access denied, gone) leaves the view unchanged.
 /// Never call with ST borrowed: the list sends GETDISPINFO back into the window proc.
+/// The pages that are drawn as big tiles (folders and drives with their usage), like Win11's Home / This PC.
+fn is_tiles_page(dir: &Path) -> bool {
+    matches!(dir.to_string_lossy().as_ref(), "::home" | "::thispc")
+}
+
 fn load(h: HWND, dir: PathBuf) {
     if !ST.with_borrow(|st| st.dir == dir) {
         COLLAPSED.with_borrow_mut(|s| s.clear()); // another folder: its groups start open
@@ -1265,6 +1276,17 @@ fn load(h: HWND, dir: PathBuf) {
             apply_view(list, view);
             if w.iter().all(|&x| x > 0) { for (k, wd) in w.iter().enumerate() { put(list, LVM_SETCOLUMNWIDTH, k, *wd as isize); } }
         }
+        let tiles = is_tiles_page(&dir);
+        if tiles {
+            ST.with_borrow_mut(|st| { st.view = ViewMode::Tiles; st.thumbs = true; st.tiles = true; });
+            THUMBS.store(true, Relaxed);
+            apply_view(list, ViewMode::Tiles);
+        } else if ST.with_borrow(|st| st.tiles) {
+            // leaving a tile page: back to the normal listing
+            ST.with_borrow_mut(|st| { st.tiles = false; st.view = ViewMode::Details; st.thumbs = false; });
+            THUMBS.store(false, Relaxed);
+            apply_view(list, ViewMode::Details);
+        }
     }
     let Some(rows) = rows_of(&dir) else { return };
     if !desk() { unsafe { SetWindowTextW(h, w(&window_title(&dir)).as_ptr()) }; }
@@ -1276,6 +1298,18 @@ fn load(h: HWND, dir: PathBuf) {
         if !NAV.load(Relaxed) { st.hist.visit(dir.clone()); }
         (st.list, st.tab, st.edit, st.search, st.active, st.rows.len())
     });
+    if ST.with_borrow(|st| st.tiles) {
+        // heading rows of the tile page: folders first, then the drives
+        let heads = ST.with_borrow(|st| {
+            let n = st.rows.len();
+            let nf = st.rows.iter().filter(|r| r.kind.is_none()).count();
+            let mut v = vec![];
+            if nf > 0 { v.push((tf!("Папки ({})", "Folders ({})", ja: "フォルダー ({})", pt: "Pastas ({})", zh: "文件夹 ({})", nf), 0)); }
+            if n > nf { v.push((tf!("Устройства и диски ({})", "Devices and drives ({})", ja: "デバイスとドライブ ({})", pt: "Dispositivos e unidades ({})", zh: "设备和驱动器 ({})", n - nf), nf)); }
+            v
+        });
+        ST.with_borrow_mut(|st| st.tile_starts = heads);
+    }
     let shown_dir = page_name(&dir).map_or_else(|| dir.to_string_lossy().into_owned(), str::to_string);
     unsafe { SetWindowTextW(edit, w(&shown_dir).as_ptr()) };
     if search != 0 as HWND { unsafe { SetWindowTextW(search, w("").as_ptr()) }; }
@@ -1387,15 +1421,17 @@ fn local_search(dir: &Path, q: &str) -> (Vec<Row>, bool, bool) {
 /// Fills the list with real items (name label and icon). The list is not virtual, so icon views lay the items out and
 /// thumbnails are attached to their items as they arrive.
 fn fill_items() {
-    let (list, view, dir, rows) = ST.with_borrow(|st| (st.list, st.view, st.dir.clone(), st.rows.clone()));
+    let (list, view, dir, rows, tiles) = ST.with_borrow(|st| (st.list, st.view, st.dir.clone(), st.rows.clone(), st.tiles));
     let desk = desk();
     let mut data: Vec<(Vec<u16>, i32)> = Vec::with_capacity(rows.len());
     for r in &rows {
-        let label = if r.hdr { r.name[1..].to_string() } else if r.target.is_some() { r.name.clone() } else { shown_name(&r.name, desk, r.dir) };
+        let label = if r.target.is_some() { r.name.clone() } else { shown_name(&r.name, desk, r.dir) };
         let img = if view.wants_thumbs() {
             r.thumb // -1 when not loaded yet: the thumbnail replaces it later
+        } else if r.icon < 0 {
+            icon_of(&r.target.clone().unwrap_or_else(|| dir.join(&r.name)), r.dir)
         } else {
-            if r.icon < 0 { icon_of(&r.target.clone().unwrap_or_else(|| dir.join(&r.name)), r.dir) } else { r.icon }
+            r.icon
         };
         data.push((label.encode_utf16().chain([0]).collect(), img));
     }
@@ -1410,8 +1446,8 @@ fn fill_items() {
             it.iImage = if *img < 0 { I_IMAGENONE } else { *img };
             put(list, LVM_INSERTITEMW, 0, &it as *const _ as isize);
         }
+        if tiles { tile_layout(list); } else if !matches!(view, ViewMode::Details | ViewMode::List) { put(list, 0x1016, 0, 0); } // LVM_ARRANGE
         SendMessageW(list, 0x000B, 1, 0);
-        if !matches!(view, ViewMode::Details | ViewMode::List) { put(list, 0x1016, 0, 0); } // LVM_ARRANGE, LVA_DEFAULT: lay the icons out once
         InvalidateRect(list, ptr::null(), 0);
     }
     if view.wants_thumbs() {
@@ -1426,6 +1462,34 @@ fn fill_items() {
             }
         }
     }
+}
+
+/// Cells of a tile page: a heading per section, then the tiles, left to right.
+pub(crate) fn tile_layout(list: HWND) {
+    let (cw, _) = unsafe { let mut r: RECT = std::mem::zeroed(); GetClientRect(list, &mut r); (r.right, r.bottom) };
+    let (cell_w, cell_h, head_h, pad) = (ui::sc(330), ui::sc(84), ui::sc(40), ui::sc(14));
+    let cols = ((cw - 2 * pad) / cell_w).max(1);
+    let starts = ST.with_borrow(|st| st.tile_starts.clone());
+    let n = put(list, LVM_GETITEMCOUNT, 0, 0) as usize;
+    let (mut y, mut bands) = (pad, Vec::new());
+    for (si, (title, at)) in starts.iter().enumerate() {
+        let end = starts.get(si + 1).map_or(n, |s| s.1).min(n);
+        bands.push((title.clone(), y));
+        y += head_h;
+        let mut col = 0;
+        for k in *at..end {
+            let x = pad + col * cell_w;
+            put(list, LVM_SETITEMPOSITION, k, ((x as isize) & 0xFFFF) | ((y as isize) << 16));
+            col += 1;
+            if col == cols {
+                col = 0;
+                y += cell_h;
+            }
+        }
+        if col != 0 { y += cell_h; }
+    }
+    let _ = cell_h;
+    ST.with_borrow_mut(|st| st.tile_bands = bands);
 }
 
 fn reset_thumbs() {
@@ -1624,6 +1688,17 @@ fn ensure_iml(list: HWND, px: i32) {
 fn apply_view(list: HWND, view: ViewMode) {
     ui::row_height(list, view == ViewMode::Details);
     if view.icon_px() > 16 { ensure_iml(list, view.icon_px()); }
+    if view == ViewMode::Tiles {
+        // icon view cells sized for a 48 px icon, the name and the drive usage line (this list ignores LVM_SETVIEW)
+        unsafe {
+            let style = GetWindowLongPtrW(list, GWL_STYLE) as u32;
+            // the tile positions come from tile_layout: auto arranging would move them back into a plain grid
+            SetWindowLongPtrW(list, GWL_STYLE, ((style & !(LVS_TYPEMASK | LVS_AUTOARRANGE)) | LVS_ICON) as isize);
+            SetWindowPos(list, ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        }
+        put(list, LVM_SETICONSPACING, 0, ((ui::sc(108) as isize) << 16) | ui::sc(238) as isize);
+        return;
+    }
     // an owner-data list ignores LVM_SETVIEW (it only hides the header): the view is the window style's type bits.
     // Icon views also need LVS_AUTOARRANGE, or the control leaves every virtual item at the same spot.
     let ty = match view {
@@ -3375,10 +3450,11 @@ fn main() {
     // the old marker file meant "group by date"; the view menu now keeps the grouping itself
     let legacy = PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\group-by-date");
     if legacy.exists() { GROUP.store(1, Relaxed); let _ = fs::remove_file(&legacy); }
-    let (compact, ext, nav_on) = read_globals().unwrap_or((false, !hide_extensions(), true));
+    let (compact, ext, nav_on, show_cap) = read_globals().unwrap_or((false, !hide_extensions(), true, true));
     COMPACT.store(compact, Relaxed);
     SHOW_EXT.store(ext, Relaxed); // the saved switch, or the Windows "Hide extensions for known file types" setting
     NAV_ON.store(nav_on, Relaxed);
+    SHOW_CAP.store(show_cap, Relaxed);
     sh::init();
     unsafe {
         SetProcessDPIAware(); // sharp text at any scaling; every size below goes through ui::sc
